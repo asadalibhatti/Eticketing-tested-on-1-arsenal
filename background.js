@@ -262,6 +262,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.action === 'notifyWebhooks') {
         console.log('[BG] notifyWebhooks requested', msg);
+        console.log('[BG] Message length:', msg.message ? msg.message.length : 0);
 
         // Use promise chaining instead of await
         chrome.storage.local.get(['discordWebhook', 'telegramWebhook']).then(data => {
@@ -270,14 +271,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const payload = msg.payload || {};
             const message = msg.message || 'Notification from Arsenal Tickets Extension';
 
+            console.log('[BG] Webhook config:', { discordWebhook: !!discordWebhook, telegramWebhook: !!telegramWebhook });
+
             if (!discordWebhook && !telegramWebhook) {
                 console.warn('[BG] No webhooks configured, skipping notification');
                 return;
             }
+            console.log('[BG] Sending webhooks...');
             sendWebhooks(discordWebhook, telegramWebhook, message, payload);
         }).catch(err => {
             console.error('[BG] Error reading webhooks config:', err);
         });
+    }
+    if (msg.action === 'notifyErrorWebhooks') {
+        console.log('[BG] notifyErrorWebhooks requested', msg);
+
+        // Hardcoded error webhook URL
+        const errorDiscordWebhook = 'https://discordapp.com/api/webhooks/1139641609240182884/umQxYbgmj_WMAe33xIFLYtkMbJJrjSk-zbZJeC_sP4__eJlEJsnQ9JL4qj2cNuPFPLWz';
+        const payload = msg.payload || {};
+        const message = msg.message || 'Error notification from Arsenal Tickets Extension';
+
+        console.log('[BG] Sending error notification to hardcoded webhook only');
+        sendErrorWebhook(errorDiscordWebhook, message, payload);
     }
     if (msg.action === 'log') {
         console.log('[BG-LOG]', msg.message);
@@ -362,8 +377,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Created event tab', created.id);
                 eventTabId = created.id;
             }
-            // //wait for 5 seconds here
-            await new Promise(resolve => setTimeout(resolve, 20000));
+            // //wait for 50 seconds here
+            await new Promise(resolve => setTimeout(resolve, 60000));
 
         }
 
@@ -705,15 +720,33 @@ async function fetchSheetConfigAll(sheetUrl) {
 //     };
 // }
 
-async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
-    console.log('[BG] sendWebhooks', {discordWebhook, telegramWebhook, message});
+async function sendErrorWebhook(errorWebhook, message, payload) {
+    console.log('[BG] sendErrorWebhook', {errorWebhook, message});
     try {
-        if (discordWebhook) {
-            await fetch(discordWebhook, {
+        if (errorWebhook) {
+            await fetch(errorWebhook, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({content: message, embeds: []})
             });
+            console.log('[BG] error webhook sent to:', errorWebhook);
+        }
+    } catch (e) {
+        console.warn('[BG] error webhook send failed', e);
+    }
+}
+
+async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
+    console.log('[BG] sendWebhooks called', {discordWebhook: !!discordWebhook, telegramWebhook: !!telegramWebhook, messageLength: message.length});
+    try {
+        if (discordWebhook) {
+            console.log('[BG] Sending to Discord webhook:', discordWebhook);
+            const response = await fetch(discordWebhook, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: message, embeds: []})
+            });
+            console.log('[BG] Discord webhook response status:', response.status);
             console.log('[BG] discord webhook sent based on google sheet set webhook url: ', discordWebhook);
 
             // if discordWebhook is different from : https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br

@@ -425,6 +425,7 @@ function parseBasketHtml(html) {
                 price: priceElement?.textContent?.trim()
             };
             
+            console.log(`[CS] Parsed basket item ${index + 1}:`, seatData);
             basketEvents.push(seatData);
         });
         
@@ -483,9 +484,9 @@ function shouldSendNotificationBasedOnSeats(basketData) {
     const pairCount = pairs.length;
     console.log('[CS] Found', pairCount, 'pairs:', pairs);
     
-    // Send notification if at least 1 pair is found
-    const shouldSend = pairCount > 0;
-    console.log('[CS] Should send notification:', shouldSend, '(at least 1 pair required)');
+    // Always send notification, but include pair information
+    const shouldSend = true;
+    console.log('[CS] Should send notification:', shouldSend, '(always send, pairs found:', pairCount, ')');
     
     return { shouldSend, pairs, pairCount };
 }
@@ -609,7 +610,7 @@ async function checkOnce() {
                     }
                 });
 
-                await delay(40000);
+                await delay(120000);
                 consecutiveErrorCount = 0; // reset after refresh
                 return;
             }
@@ -662,7 +663,7 @@ async function checkOnce() {
                 }
             });
             //wait for 70 seconds before next check
-            await delay(70000);
+            await delay(120000);
             notfound400erorsCount = 0; // reset error counter
 
 
@@ -693,12 +694,53 @@ async function checkOnce() {
 
 
     console.log('[CS] tickets available seats found:', data);
-    // pick first area and first price band
-    const area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
+    console.log('[CS] Total areas found:', data.length);
+    console.log('[CS] Area IDs found:', data.map(a => a.AreaId).join(', '));
+    
+    // Filter out club level areas (known club level area IDs for Arsenal Emirates Stadium)
+    // upper tier range 1942-1988
+    // lower tier range 1691-1941
+    // Club level area IDs: 1647-1690
+    const clubLevelAreaIds = [
+        1647, 1648, 1649, 1650, 1651, 1652, 1653, 1654, 1655, 1656, 1657, 1658, 1659, 1660,
+        1661, 1662, 1663, 1664, 1665, 1666, 1667, 1668, 1669, 1670, 1671, 1672, 1673, 1674, 1675, 1676, 1677, 1678, 1679, 1680,
+        1681, 1682, 1683, 1684, 1685, 1686, 1687, 1688, 1689, 1690
+    ];
+    
+    // Filter out club level areas and pick first non-club level area
+    const nonClubLevelAreas = data.filter(a => 
+        a.PriceBands && 
+        a.PriceBands.length && 
+        !clubLevelAreaIds.includes(a.AreaId)
+    );
+    
+    console.log('[CS] Non-club level areas found:', nonClubLevelAreas.length);
+    console.log('[CS] Non-club level area IDs:', nonClubLevelAreas.map(a => a.AreaId).join(', '));
+    
+    // If no non-club level areas found, check if only club level areas are available
+    if (nonClubLevelAreas.length === 0) {
+        const clubLevelAreas = data.filter(a => 
+            a.PriceBands && 
+            a.PriceBands.length && 
+            clubLevelAreaIds.includes(a.AreaId)
+        );
+        
+        if (clubLevelAreas.length > 0) {
+            console.log('[CS] Ignoring club level tickets found with areas:', clubLevelAreas.map(a => a.AreaId).join(', '));
+            return;
+        }
+       
+        
+    }
+    
+    // If no non-club level areas found, fall back to any available area
+    const area = nonClubLevelAreas.length > 0 ? nonClubLevelAreas[nonClubLevelAreas.length - 1] : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
     const priceBand = area.PriceBands[0];
     const areaId = area.AreaId;
     const priceBandId = priceBand.PriceBandCode || priceBand.PriceBandId || priceBandId;
-    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId);
+    
+    const isClubLevel = clubLevelAreaIds.includes(areaId);
+    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId, isClubLevel ? '(CLUB LEVEL - filtered out)' : '(NON-CLUB LEVEL)');
 
 
     // Step 1: Get the token from localStorage
@@ -755,12 +797,12 @@ async function checkOnce() {
     } catch (e) {
         console.error('[CS] lock fetch failed', e);
         //send message to webhook
-        const errorMessage = `Error locking seats: ${e.message} for received data ${JSON.stringify(data)}`;
+        const errorMessage = `\n\nError locking seats: ${e.message} for received data ${JSON.stringify(data)}`;
         
         
-        // Also send to background for general webhook dispatch
+        // Also send to background for error webhook dispatch
         chrome.runtime.sendMessage({
-            action: 'notifyWebhooks',
+            action: 'notifyErrorWebhooks',
             message: errorMessage,
             payload: null
         });
@@ -769,22 +811,8 @@ async function checkOnce() {
     }
 
     console.log('[CS] lock response status', lockRes.status);
-    // send message to webhook
-    if (lockRes.status !== 200) {
-        const errorMessage = `Error locking seats: ${lockRes.status} for received data ${JSON.stringify(data)}`;
-        console.warn('[CS] sending error notification:', errorMessage);
-        
-       
-        
-        // Also send to background for general webhook dispatch
-        chrome.runtime.sendMessage({
-            action: 'notifyWebhooks',
-            message: errorMessage,
-            payload: null
-        });
-    }
-
-
+    
+    // Handle different lock response statuses
     if (lockRes.status === 403) {
         console.warn('[CS] lock got 403 Forbidden, trying to add directly to basket with 2nd api');
 
@@ -793,9 +821,9 @@ async function checkOnce() {
             console.warn('[CS] direct add to basket failed for all areas, stopping monitoring');
             
             // Send webhook message about the failure
-            const errorMessage = `Direct add to basket failed for all areas. Event ${monitor.eventId}. Seats were found but could not be added to basket.`;
+            const errorMessage = `🎫 Direct add to basket failed for all areas. Event ${monitor.eventId}. Seats were found but could not be added to basket.`;
             chrome.runtime.sendMessage({
-                action: 'notifyWebhooks',
+                action: 'notifyErrorWebhooks',
                 message: errorMessage,
                 payload: null
             });
@@ -806,20 +834,27 @@ async function checkOnce() {
         console.log('[CS] direct add to basket successful, going to next lines to send notifications');
         // return;
     } else if (lockRes.status === 400 || lockRes.status === 404) {
-        console.warn('[CS] lock got 400 Bad Request, likely issue with verification token or no seats available');
-        // stop monitoring if no seats available
-        //send message to webhook
-        let message1 = `Seat with areaId ${areaId} and priceBandId ${priceBandId} found but not able to Lock them for Event ${monitor.eventId}. Status: ${lockRes.status}`;
-        //send message
-        console.log('[CS] message to send:', message1);
-
-        // Send to background for webhook dispatch
+        console.warn('[CS] lock got 400/404, likely issue with verification token or no seats available');
+        
+        // Send webhook message about the failure
+        const errorMessage = `🎫 Seat with areaId ${areaId} and priceBandId ${priceBandId} found but not able to Lock them for Event ${monitor.eventId}. Status: ${lockRes.status}`;
         chrome.runtime.sendMessage({
-            action: 'notifyWebhooks',
-            message: message1,
+            action: 'notifyErrorWebhooks',
+            message: errorMessage,
             payload: null
         });
 
+        return;
+    } else if (lockRes.status !== 200) {
+        // Handle any other non-200 status codes
+        const errorMessage = `🎫 Error locking seats: ${lockRes.status} for received data ${JSON.stringify(data)}`;
+        console.warn('[CS] sending error notification:', errorMessage);
+        
+        chrome.runtime.sendMessage({
+            action: 'notifyErrorWebhooks',
+            message: errorMessage,
+            payload: null
+        });
 
         return;
     } else {
@@ -877,46 +912,7 @@ async function checkOnce() {
 
     }
 
-// Check basket for seat details before getting data layer
-    const basketUrl = `https://www.eticketing.co.uk/${clubName}/Checkout/Basket`;
-    console.log('[CS] fetching basket details', basketUrl);
-    let basketRes;
-    let basketHtml = '';
-    let shouldSendNotification = true;
-    
-    try {
-        basketRes = await fetch(basketUrl, {
-            method: 'GET',
-            headers: {
-                "authority": "www.eticketing.co.uk",
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "accept-language": "en-US,en;q=0.9,ur;q=0.8",
-                "dnt": "1",
-                "referer": monitor.eventUrl,
-                "x-requested-with": "XMLHttpRequest"
-            },
-            credentials: "include"
-        });
-        
-        if (basketRes.ok) {
-            basketHtml = await basketRes.text();
-            console.log('[CS] basket HTML fetched successfully');
-            
-            // Parse basket HTML to check seat details
-            const basketData = parseBasketHtml(basketHtml);
-            console.log('[CS] parsed basket data:', basketData);
-            
-            // Check if we should send notification based on seat details
-            const notificationResult = shouldSendNotificationBasedOnSeats(basketData);
-            shouldSendNotification = notificationResult.shouldSend;
-            const pairInfo = notificationResult;
-            console.log('[CS] should send notification:', shouldSendNotification);
-        } else {
-            console.warn('[CS] basket fetch failed with status:', basketRes.status);
-        }
-    } catch (e) {
-        console.warn('[CS] basket fetch error:', e);
-    }
+// Basket HTML will be fetched only if needed after dataLayer processing
 
 // Get data layer (products added to basket)
     const dlUrl = `https://www.eticketing.co.uk/arsenal/tagManager/GetDataLayer`;
@@ -965,18 +961,114 @@ async function checkOnce() {
     const EMAIL_KEY = "user_email";
     const userEmail = localStorage.getItem(EMAIL_KEY) || "Unknown Email";
 
-    const products = dlJson?.[0]?.products || [];
+    // Extract information from dataLayer - look for the last basket_viewed event
+    let basketData = null;
+    let products = [];
+    let eventName = "Unknown Event";
+    let eventDate = "Unknown Date/Time";
+    let totalValue = 0;
+    let currency = "GBP";
+    let membershipType = "Unknown";
+    let crn = "Unknown";
+    
+    if (dlJson && Array.isArray(dlJson)) {
+        // Find the last basket_viewed event which contains current basket items
+        const basketViewedEvents = dlJson.filter(item => item.event === 'basket_viewed');
+        if (basketViewedEvents.length > 0) {
+            basketData = basketViewedEvents[basketViewedEvents.length - 1]; // Get the last one
+            products = basketData.products || [];
+            totalValue = basketData.value || 0;
+            currency = basketData.currency || "GBP";
+            membershipType = basketData.membership_type || "Unknown";
+            crn = basketData.crn || "Unknown";
+            
+            if (products.length > 0) {
+                eventName = products[0].name || "Unknown Event";
+                eventDate = products[0].kickoff_datetime || "Unknown Date/Time";
+            }
+        }
+    }
+    
+    // Check if we need to fall back to basket HTML information
+    // This happens when:
+    // 1. Products array is empty, OR
+    // 2. Products array length doesn't match the quantity (incomplete data)
+    const expectedQuantity = basketData ? basketData.quantity || 0 : 0;
+    const needsFallback = products.length === 0 || (expectedQuantity > 0 && products.length < expectedQuantity);
+    
+    // Only fetch basket HTML if dataLayer is incomplete
+    if (needsFallback) {
+        console.log(`[CS] DataLayer incomplete: products=${products.length}, quantity=${expectedQuantity}, fetching basket HTML`);
+        
+        const basketUrl = `https://www.eticketing.co.uk/${clubName}/Checkout/Basket`;
+        try {
+            const basketRes = await fetch(basketUrl, {
+                method: 'GET',
+                headers: {
+                    "authority": "www.eticketing.co.uk",
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "accept-language": "en-US,en;q=0.9,ur;q=0.8",
+                    "dnt": "1",
+                    "referer": monitor.eventUrl,
+                    "x-requested-with": "XMLHttpRequest"
+                },
+                credentials: "include"
+            });
+            
+            if (basketRes.ok) {
+                const basketHtml = await basketRes.text();
+                console.log('[CS] basket HTML fetched successfully for fallback');
+                
+                // Parse basket HTML to get seat details
+                const basketHtmlData = parseBasketHtml(basketHtml);
+                console.log('[CS] parsed basket HTML data:', basketHtmlData);
+                
+                if (basketHtmlData.events && basketHtmlData.events.length > 0) {
+                    products = basketHtmlData.events.map(event => ({
+                        seatBlock: event.block,
+                        seatRow: event.row,
+                        seatSeat: event.seat,
+                        seatArea: event.area,
+                        category_2: event.priceClass,
+                        price: event.price,
+                        currency: "GBP",
+                        name: "Unknown Event",
+                        kickoff_datetime: "Unknown Date/Time",
+                        category_3: event.block && event.block.toLowerCase().includes('club level') ? 'Club Level' : 'General',
+                        business_line: "eTicketing",
+                        filter_event_type: "Unknown"
+                    }));
+                    
+                    console.log(`[CS] Using basket HTML data: ${products.length} seats found`);
+                    
+                    // Set event name and date from monitor if available
+                    if (monitor.eventUrl) {
+                        eventName = "Event from URL";
+                        eventDate = "Unknown Date/Time";
+                    }
+                } else {
+                    console.warn('[CS] No basket events found in HTML');
+                }
+            } else {
+                console.warn('[CS] basket HTML fetch failed with status:', basketRes.status);
+            }
+        } catch (e) {
+            console.warn('[CS] basket HTML fetch error:', e);
+        }
+    } else {
+        console.log(`[CS] DataLayer complete: products=${products.length}, quantity=${expectedQuantity}, no need for basket HTML`);
+    }
 
+    // Build seat info with proper price formatting
     const seatInfo = products.map((p, idx) => {
-        return `**[${idx + 1}]** ${p.seatBlock} - Row ${p.seatRow} Seat ${p.seatSeat}  
-• Area: ${p.seatArea}  
-• Category: ${p.category_2 || "N/A"}  
-• Price: ${p.price} ${p.currency}`;
-    }).join("\n\n");
+        const isClubLevel = p.seatBlock && p.seatBlock.toLowerCase().includes('club level');
+        const clubLevelIndicator = isClubLevel ? ' 🏆' : '';
+        const price = p.price && p.price !== 'undefined' ? p.price : 'N/A';
+        const currency = p.currency && p.currency !== 'undefined' ? p.currency : 'GBP';
+        return `**[${idx + 1}]** ${p.seatBlock}${clubLevelIndicator} - Row ${p.seatRow} Seat ${p.seatSeat} (${price} ${currency})`;
+    }).join("\n");
 
     const firstProduct = products[0] || {};
-    const eventName = firstProduct.name || "Unknown Event";
-    const eventDate = firstProduct.kickoff_datetime || "Unknown Date/Time";
 
 // Format current local date & time
     const now = new Date();
@@ -990,60 +1082,103 @@ async function checkOnce() {
         second: "2-digit"
     });
 
-// Check if last message was sent recently
-    const LAST_MESSAGE_TIME_KEY = "last_message_time";
-    const lastMessageTime = parseInt(localStorage.getItem(LAST_MESSAGE_TIME_KEY), 10) || 0;
-    const timeSinceLastMessage = now.getTime() - lastMessageTime;
-    localStorage.setItem(LAST_MESSAGE_TIME_KEY, now.getTime());
+// Removed duplicate prevention filter - notifications will be sent every time
 
 
-    // Add pair information to the message
+    // Detect pairs from products (either dataLayer or basket HTML)
     let pairInfoText = '';
-    if (typeof pairInfo !== 'undefined' && pairInfo.pairCount > 0) {
-        const pairDetails = pairInfo.pairs.map((pair, idx) => {
-            return `**[Pair ${idx + 1}]** ${pair.block} - Row ${pair.row}  
-• Seats: ${pair.seat1.seat} & ${pair.seat2.seat}  
-• Price: ${pair.seat1.price || 'N/A'}`;
-        }).join("\n\n");
+    let basketDetailsText = '';
+    
+    if (products.length > 0) {
+        // Group seats by block and row to find pairs
+        const seatGroups = {};
+        products.forEach(product => {
+            const key = `${product.seatBlock}-${product.seatRow}`;
+            if (!seatGroups[key]) {
+                seatGroups[key] = [];
+            }
+            seatGroups[key].push({
+                ...product,
+                seatNumber: parseInt(product.seatSeat) || 0
+            });
+        });
+        
+        // Find pairs (adjacent seats in same block and row)
+        const pairs = [];
+        Object.values(seatGroups).forEach(group => {
+            // Sort by seat number
+            group.sort((a, b) => a.seatNumber - b.seatNumber);
+            
+            // Find adjacent seats
+            for (let i = 0; i < group.length - 1; i++) {
+                if (group[i + 1].seatNumber === group[i].seatNumber + 1) {
+                    pairs.push({
+                        seat1: group[i],
+                        seat2: group[i + 1],
+                        block: group[i].seatBlock,
+                        row: group[i].seatRow
+                    });
+                    i++; // Skip next seat as it's already paired
+                }
+            }
+        });
+        
+        const pairCount = pairs.length;
+        console.log('[CS] Found', pairCount, 'pairs from products:', pairs);
+        
+        // Add pair information (always show, even if 0 pairs)
+        const pairDetails = pairs.map((pair, idx) => {
+            return `**[Pair ${idx + 1}]** ${pair.block} - Row ${pair.row} Seats: ${pair.seat1.seatSeat} & ${pair.seat2.seatSeat}`;
+        }).join("\n");
         
         pairInfoText = `
-            
-            **🎫 Pairs Found:** ${pairInfo.pairCount}  
-            ${pairDetails}`;
+        
+**🎫 PAIRS:** ${pairCount}  
+${pairCount > 0 ? pairDetails : 'No adjacent pairs found'}`;
+        
+        // No need to show basket details note
     }
 
     const message =
-        `\n\n🎟 **Ticket(s) Added to Basket**  
-            ━━━━━━━━━━━━━━━━━━  
-            📅 **Generated:** ${formattedNow}  
+        `🎟 **TICKET SUCCESS - Added to Basket**  
+════════════════════════════════════════════════════════════════  
+📅 **Time:** ${new Date().toLocaleString('en-GB', { 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit' 
+            })}  
+🏟️ **Game:** ${eventName}  
+🆔 **Event ID:** ${monitor.eventId}  
+👤 **Account:** ${userEmail}  
+📍 **Endpoint:** ${endpointType}  
             
-            **Event:** ${eventName} (ID: ${monitor.eventId})  
-            **Date/Time:** ${eventDate}  
-            **Event URL:** ${monitor.eventUrl}  
+🎫 **TICKETS:**  
+${seatInfo}${pairInfoText}
             
-            👤 **Account Email:** ${userEmail}  
+🎯 **SUMMARY:**  
+✅ **Total Seats:** ${expectedQuantity || products.length}  
+💰 **Total Value:** ${totalValue} ${currency}  
             
-            **Seat Details:**  
-            ${seatInfo}${pairInfoText}
-
-            ━━━━━━━━━━━━━━━━━━  
-            **Total Tickets:** ${products.length}  
-            🏢 Business Line: ${firstProduct.business_line || "N/A"}  
-            🎭 Event Type: ${firstProduct.filter_event_type || "N/A"}`;
+════════════════════════════════════════════════════════════════`;
 
     console.log('[CS] message to send:', message);
 
-    // Send to background for webhook dispatch only if notification should be sent
-    if (shouldSendNotification) {
-        console.log('[CS] Sending webhook notification based on seat analysis (pairs found)');
-        chrome.runtime.sendMessage({
-            action: 'notifyWebhooks',
-            message,
-            payload: dlJson
-        });
-    } else {
-        console.log('[CS] Skipping webhook notification based on seat analysis (no pairs found)');
-    }
+    // Always send success notification when tickets are added to basket
+    console.log('[CS] Sending success webhook notification - tickets added to basket');
+    console.log('[CS] Webhook message length:', message.length);
+    console.log('[CS] Webhook payload:', dlJson);
+    
+    chrome.runtime.sendMessage({
+        action: 'notifyWebhooks',
+        message,
+        payload: dlJson
+    }, (response) => {
+        if (chrome.runtime.lastError) {
+            console.error('[CS] Webhook send error:', chrome.runtime.lastError);
+        } else {
+            console.log('[CS] Webhook send response:', response);
+        }
+    });
 
 // Play 5s sound
 // playNotifySound(5000);
