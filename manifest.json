@@ -1,0 +1,71 @@
+{
+  "manifest_version": 3,
+  "name": "ETicketing Ticket Monitor & Auto-Book",
+  "version": "1.0",
+  "description": "Monitors eticketing seats, locks seats, adds to basket, notifies Discord/Telegram and plays sound.",
+  "permissions": [
+    "storage",
+    "scripting",
+    "tabs",
+    "notifications",
+    "activeTab",
+    "management",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://www.eticketing.co.uk/*",
+    "https://docs.google.com/*",
+    "https://discord.com/*",
+    "https://api.telegram.org/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://ticketmastersportuk.queue-it.net/*"
+      ],
+      "js": [
+        "queueit_script.js"
+      ]
+    },
+    {
+      "matches": [
+        "https://www.eticketing.co.uk/*"
+      ],
+      "js": [
+        "content.js"
+      ]
+    },
+    {
+      "matches": ["https://myaccount.arsenal.com/login*"],
+      "js": ["login_arsenal_content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.eticketing.co.uk/*"
+      ],
+      "js": [
+        "requestVerification-content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sounds/notify.mp3"
+      ],
+      "matches": [
+        "https://www.eticketing.co.uk/*"
+      ]
+    }
+  ]
+}
