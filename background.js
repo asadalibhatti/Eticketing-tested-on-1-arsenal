@@ -232,11 +232,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     console.log(`[BG] Cookie cleared: ${cookie.name}`);
                 });
             });
+            // Send response after clearing cookies
+            sendResponse({success: true, message: 'Cookies cleared successfully'});
         });
 
         // if (sender.tab?.id) {
         //     chrome.tabs.reload(sender.tab.id);
         // }
+        return true; // keep channel open for async response
     }
     if (msg.action === 'manualStart') {
         console.log('[BG] manualStart requested from popup');
@@ -250,7 +253,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.action === 'closeOtherTabsExcept') {
         console.log('[BG] closeOtherTabsExcept requested', msg);
-        closeOtherEticketingTabs();
+        closeOtherEticketingTabs()
+            .then(() => {
+                console.log('[BG] closeOtherTabsExcept completed successfully');
+                sendResponse({success: true, message: 'Other tabs closed successfully'});
+            })
+            .catch(err => {
+                console.error('[BG] closeOtherTabsExcept error:', err);
+                sendResponse({success: false, message: err?.message || 'Unknown error'});
+            });
+        return true; // keep channel open for async response
     }
     if (msg.action === 'refreshEventTab') {
         console.log('[BG] refreshEventTab requested', msg);
@@ -263,7 +275,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 console.error('[BG] refreshEventTab error:', err);
                 sendResponse({success: false, message: err?.message || 'Unknown error'});
             });
-        // return true; // keep channel open
+        return true; // keep channel open for async response
     }
     if (msg.action === 'notifyWebhooks') {
         console.log('[BG] notifyWebhooks requested', msg);
@@ -305,8 +317,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'openNewTab') {
         console.log('[BG] Opening new tab with URL:', msg.url);
         chrome.tabs.create({ url: msg.url })
-            .then(() => console.log('[BG] New tab opened successfully'))
-            .catch(error => console.error('[BG] Error opening new tab:', error));
+            .then(() => {
+                console.log('[BG] New tab opened successfully');
+                sendResponse({success: true, message: 'New tab opened successfully'});
+            })
+            .catch(error => {
+                console.error('[BG] Error opening new tab:', error);
+                sendResponse({success: false, message: error?.message || 'Unknown error'});
+            });
+        return true; // keep channel open for async response
     }
     if (msg.type === "heartbeat" && sender.tab?.id) {
         heartbeatTracker[sender.tab.id] = Date.now();

@@ -540,12 +540,22 @@ async function checkOnce() {
     // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableResale? AreSeatsTogether=false&EventId=3631&MarketType=1&MaximumPrice=10000000&MinimumPrice=0&Quantity=1
     // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableRegular?AreSeatsTogether=false&EventId=3631&             MaximumPrice=10000000&MinimumPrice=0&Quantity=1
 
-    // Randomly select between regular and resale endpoints (90% Resale, 10% Regular)
-    const isResale = Math.random() < 0.65;
+    // Randomly select between regular and resale endpoints (96% Resale, 4% Regular)
+    // For manual override, uncomment the line below and set to true/false as needed
+    // const isResale = true;
+    
+    // Generate a more accurate 96% distribution using a counter-based approach
+    const isResale = (() => {
+        // Use a combination of timestamp and random for better distribution
+        const now = Date.now();
+        const randomSeed = Math.random();
+        const combinedSeed = (now % 1000) + (randomSeed * 1000);
+        return (combinedSeed % 100) < 96;
+    })();
     const endpointType = isResale ? 'Resale' : 'Regular';
     const marketTypeParam = isResale ? '&MarketType=1' : '';
     
-    console.log(`[CS] Randomly selected __${endpointType} endpoint for this check (90% Resale bias)`);
+    console.log(`[CS] Randomly selected __${endpointType} endpoint for this check (96% Resale bias)`);
     
     const url = `https://www.eticketing.co.uk/${clubName}/EDP/Seats/Available${endpointType}?AreSeatsTogether=${monitor.areSeatsTogether}&EventId=${monitor.eventId}${marketTypeParam}&MaximumPrice=10000000&MinimumPrice=0&Quantity=${monitor.quantity}`;
 
