@@ -131,9 +131,9 @@ async function pollSheetAndControl() {
         }
         //else if current status is on, make sure the two tabs are open else re open them
         else if (currentStatus === 'on') {
-            if (tabsOpenRecheckCount >= 24) {// 25 * 5 seconds = 2 minutes
+            if (tabsOpenRecheckCount >= 48) {// 48 * 5 seconds = 2 minutes
                 tabsOpenRecheckCount = 0;
-                console.log('[BG] on 2 minutes re check , Current status is ON, checking if tabs are open');
+                console.log('[BG] on 4 minutes re check , Current status is ON, checking if tabs are open');
                 //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
 
                 //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
@@ -152,6 +152,11 @@ async function pollSheetAndControl() {
                 } else {
                     console.log('[BG] EventNotAllowed tab already open on 2 minutes recheck', notAllowedTabs[0].id);
                 }
+                // Close other eticketing tabs
+                await closeOtherEticketingTabs();
+                //wait for 5 seconds
+                await new Promise(resolve => setTimeout(resolve, 60000));
+
 
             }
             tabsOpenRecheckCount++;
@@ -297,6 +302,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'log') {
         console.log('[BG-LOG]', msg.message);
     }
+    if (msg.action === 'openNewTab') {
+        console.log('[BG] Opening new tab with URL:', msg.url);
+        chrome.tabs.create({ url: msg.url })
+            .then(() => console.log('[BG] New tab opened successfully'))
+            .catch(error => console.error('[BG] Error opening new tab:', error));
+    }
     if (msg.type === "heartbeat" && sender.tab?.id) {
         heartbeatTracker[sender.tab.id] = Date.now();
         console.log(`[BG] Heartbeat received from tab ${sender.tab.id}`);
@@ -398,8 +409,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
         }
 
 
-        // Wait for 10 seconds
-        await new Promise(resolve => setTimeout(resolve, 40000));
+        // Wait for 40 seconds
+        await new Promise(resolve => setTimeout(resolve, 10000));
 
         // check if any tab with starting url: http://ticketmastersportuk.queue-it.net/ or https://web-identity than wait for 10 seconds
         async function checkTabsAndWait() {
@@ -415,9 +426,9 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log("[BG] Waiting 80 seconds...");
 
                 // Wait using a Promise
-                await new Promise(resolve => setTimeout(resolve, 100000));
+                await new Promise(resolve => setTimeout(resolve, 120000));
 
-                console.log("[BG] 100 seconds passed, you can do something here.");
+                console.log("[BG] 120 seconds passed, you can do something here.");
                 // Example: reload the tab
                 // await chrome.tabs.reload(matchTab.id);
             } else {
@@ -427,6 +438,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
         // check if queue or web identity tabs still there
         await checkTabsAndWait();
+         // Close other eticketing tabs
+        await closeOtherEticketingTabs(); 
 
 
         // Recheck to ensure tabs are still valid
@@ -441,7 +454,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 eventTabId = created.id;
             }
             //wait for 5 seconds here
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            await new Promise(resolve => setTimeout(resolve, 60000));
         }
 
         if (EVENT_NOT_ALLOWED_URL) {
@@ -450,6 +463,9 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Validation tab closed, reopening...');
                 const created2 = await chrome.tabs.create({url: EVENT_NOT_ALLOWED_URL, active: false});
                 notAllowedTabId = created2.id;
+            
+                //wait for 5 seconds
+                await new Promise(resolve => setTimeout(resolve, 60000));
             }
 
             // Send message to Not Allowed tab
@@ -476,8 +492,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             // }
         }
 
-        // Close other eticketing tabs
-        await closeOtherEticketingTabs();
+       
 
         //if there are more than 1 event tab close other event tabs only keep one tab open
         const eventTabs = tabs2.filter(t => t.url && t.url.startsWith(eventUrl));
@@ -485,6 +500,16 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             console.log('[BG] More than 1 event tab found, closing other event tabs');
             for (const t of eventTabs) {
                 if (t.id !== eventTabId) {
+                    await chrome.tabs.remove(t.id);
+                }
+            }
+        }
+        //if there are more than 1 not allowed tab close other not allowed tabs only keep one tab open
+        const notAllowedTabs = tabs2.filter(t => t.url && t.url.startsWith(EVENT_NOT_ALLOWED_URL));
+        if (notAllowedTabs.length > 1) {
+            console.log('[BG] More than 1 not allowed tab found, closing other not allowed tabs');
+            for (const t of notAllowedTabs) {
+                if (t.id !== notAllowedTabId) {
                     await chrome.tabs.remove(t.id);
                 }
             }

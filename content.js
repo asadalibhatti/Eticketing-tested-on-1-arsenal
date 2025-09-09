@@ -16,7 +16,7 @@ if (document.title.includes("Your Browsing Activity Has")) {
             console.warn("[CS] Tab title did not change within 10 seconds. Reloading the page...");
             window.location.reload();
         }
-    }, 10000);
+    }, 60000);
 }
 
 let monitor = {
@@ -540,12 +540,12 @@ async function checkOnce() {
     // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableResale? AreSeatsTogether=false&EventId=3631&MarketType=1&MaximumPrice=10000000&MinimumPrice=0&Quantity=1
     // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableRegular?AreSeatsTogether=false&EventId=3631&             MaximumPrice=10000000&MinimumPrice=0&Quantity=1
 
-    // Randomly select between regular and resale endpoints
-    const isResale = Math.random() < 0.5;
+    // Randomly select between regular and resale endpoints (90% Resale, 10% Regular)
+    const isResale = Math.random() < 0.65;
     const endpointType = isResale ? 'Resale' : 'Regular';
     const marketTypeParam = isResale ? '&MarketType=1' : '';
     
-    console.log(`[CS] Randomly selected __${endpointType} endpoint for this check`);
+    console.log(`[CS] Randomly selected __${endpointType} endpoint for this check (90% Resale bias)`);
     
     const url = `https://www.eticketing.co.uk/${clubName}/EDP/Seats/Available${endpointType}?AreSeatsTogether=${monitor.areSeatsTogether}&EventId=${monitor.eventId}${marketTypeParam}&MaximumPrice=10000000&MinimumPrice=0&Quantity=${monitor.quantity}`;
 
@@ -697,7 +697,7 @@ async function checkOnce() {
     console.log('[CS] Total areas found:', data.length);
     console.log('[CS] Area IDs found:', data.map(a => a.AreaId).join(', '));
     
-    // Filter out club level areas (known club level area IDs for Arsenal Emirates Stadium)
+    // Filter out club level and upper tier areas (known area IDs for Arsenal Emirates Stadium)
     // upper tier range 1942-1988
     // lower tier range 1691-1941
     // Club level area IDs: 1647-1690
@@ -707,40 +707,60 @@ async function checkOnce() {
         1681, 1682, 1683, 1684, 1685, 1686, 1687, 1688, 1689, 1690
     ];
     
-    // Filter out club level areas and pick first non-club level area
-    const nonClubLevelAreas = data.filter(a => 
+    const upperTierAreaIds = [
+        1942, 1943, 1944, 1945, 1946, 1947, 1948, 1949, 1950, 1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960,
+        1961, 1962, 1963, 1964, 1965, 1966, 1967, 1968, 1969, 1970, 1971, 1972, 1973, 1974, 1975, 1976, 1977, 1978, 1979, 1980,
+        1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988
+    ];
+    
+    // Filter out club level and upper tier areas, keep only lower tier areas
+    const preferredAreas = data.filter(a => 
         a.PriceBands && 
         a.PriceBands.length && 
-        !clubLevelAreaIds.includes(a.AreaId)
+        !clubLevelAreaIds.includes(a.AreaId) &&
+        !upperTierAreaIds.includes(a.AreaId)
     );
     
-    console.log('[CS] Non-club level areas found:', nonClubLevelAreas.length);
-    console.log('[CS] Non-club level area IDs:', nonClubLevelAreas.map(a => a.AreaId).join(', '));
+    console.log('[CS] Preferred areas found (lower tier only):', preferredAreas.length);
+    console.log('[CS] Preferred area IDs:', preferredAreas.map(a => a.AreaId).join(', '));
     
-    // If no non-club level areas found, check if only club level areas are available
-    if (nonClubLevelAreas.length === 0) {
+    // If no preferred areas found, check what areas are available
+    if (preferredAreas.length === 0) {
         const clubLevelAreas = data.filter(a => 
             a.PriceBands && 
             a.PriceBands.length && 
             clubLevelAreaIds.includes(a.AreaId)
         );
         
-        if (clubLevelAreas.length > 0) {
-            console.log('[CS] Ignoring club level tickets found with areas:', clubLevelAreas.map(a => a.AreaId).join(', '));
+        const upperTierAreas = data.filter(a => 
+            a.PriceBands && 
+            a.PriceBands.length && 
+            upperTierAreaIds.includes(a.AreaId)
+        );
+        
+        if (clubLevelAreas.length > 0 || upperTierAreas.length > 0) {
+            console.log('[CS] Ignoring club level and upper tier tickets found with areas:');
+            if (clubLevelAreas.length > 0) {
+                console.log('[CS] Club level areas:', clubLevelAreas.map(a => a.AreaId).join(', '));
+            }
+            if (upperTierAreas.length > 0) {
+                console.log('[CS] Upper tier areas:', upperTierAreas.map(a => a.AreaId).join(', '));
+            }
             return;
         }
-       
         
     }
     
-    // If no non-club level areas found, fall back to any available area
-    const area = nonClubLevelAreas.length > 0 ? nonClubLevelAreas[nonClubLevelAreas.length - 1] : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
+    // If no preferred areas found, fall back to any available area
+    const area = preferredAreas.length > 0 ? preferredAreas[preferredAreas.length - 1] : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
     const priceBand = area.PriceBands[0];
     const areaId = area.AreaId;
     const priceBandId = priceBand.PriceBandCode || priceBand.PriceBandId || priceBandId;
     
     const isClubLevel = clubLevelAreaIds.includes(areaId);
-    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId, isClubLevel ? '(CLUB LEVEL - filtered out)' : '(NON-CLUB LEVEL)');
+    const isUpperTier = upperTierAreaIds.includes(areaId);
+    const areaType = isClubLevel ? 'CLUB LEVEL' : isUpperTier ? 'UPPER TIER' : 'LOWER TIER';
+    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId, `(${areaType})`);
 
 
     // Step 1: Get the token from localStorage
@@ -1149,6 +1169,8 @@ ${pairCount > 0 ? pairDetails : 'No adjacent pairs found'}`;
             })}  
 🏟️ **Game:** ${eventName}  
 🆔 **Event ID:** ${monitor.eventId}  
+🔗 **Event URL:** ${monitor.eventUrl}  
+📍 **Area ID:** ${areaId}  
 👤 **Account:** ${userEmail}  
 📍 **Endpoint:** ${endpointType}  
             
@@ -1178,6 +1200,13 @@ ${seatInfo}${pairInfoText}
         } else {
             console.log('[CS] Webhook send response:', response);
         }
+    });
+
+    // Open new tab after sending success notification
+    console.log('[CS] Opening new tab with success URL');
+    chrome.runtime.sendMessage({
+        action: 'openNewTab',
+        url: 'https://www.exampleTicketsbasketaddedinthisWindow.com'
     });
 
 // Play 5s sound
