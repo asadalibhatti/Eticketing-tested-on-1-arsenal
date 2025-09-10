@@ -30,18 +30,24 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
 
             const captchaInput = document.querySelector('input#solution');
             const robotButton = document.querySelector('button.botdetect-button');
+            // <button id="buttonConfirmRedirect" type="button" class="btn" data-bind="click: setActiveClient"><span class="l">Yes, please</span><span class="r">&nbsp;</span></button>
+
             const confirmRedirectButton = document.querySelector('button#buttonConfirmRedirect');
 
             // Check for the confirm redirect button first
-            if (confirmRedirectButton) {
-                console.log("[QueueIt Script] Confirm redirect button found. Clicking immediately...");
+            if (confirmRedirectButton) {// yes please button
+                console.log("[QueueIt Script] Confirm redirect button found.");
                 clearInterval(checkElements);
                 //wait for 5 seconds
-                await new Promise(resolve => setTimeout(resolve, 120000));
+                // await new Promise(resolve => setTimeout(resolve, 100000));
                 //click the confirm redirect button
                 confirmRedirectButton.click();
                 //wait for 60 seconds
-                // await new Promise(resolve => setTimeout(resolve, 60000));
+                console.log("[QueueIt Script] Waiting for 120 seconds...");
+                await new Promise(resolve => setTimeout(resolve, 120000));
+
+                //click the confirm redirect button
+                confirmRedirectButton.click();
 
                 return;
             }

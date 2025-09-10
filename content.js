@@ -550,7 +550,7 @@ async function checkOnce() {
         const now = Date.now();
         const randomSeed = Math.random();
         const combinedSeed = (now % 1000) + (randomSeed * 1000);
-        return (combinedSeed % 100) < 96;
+        return (combinedSeed % 100) < 96;//chances of resale
     })();
     const endpointType = isResale ? 'Resale' : 'Regular';
     const marketTypeParam = isResale ? '&MarketType=1' : '';
@@ -711,12 +711,18 @@ async function checkOnce() {
     // upper tier range 1942-1988
     // lower tier range 1691-1941
     // Club level area IDs: 1647-1690
+    // const clubLevelAreaIds = [
+        
+    // ];
     const clubLevelAreaIds = [
         1647, 1648, 1649, 1650, 1651, 1652, 1653, 1654, 1655, 1656, 1657, 1658, 1659, 1660,
         1661, 1662, 1663, 1664, 1665, 1666, 1667, 1668, 1669, 1670, 1671, 1672, 1673, 1674, 1675, 1676, 1677, 1678, 1679, 1680,
         1681, 1682, 1683, 1684, 1685, 1686, 1687, 1688, 1689, 1690
     ];
     
+    // const upperTierAreaIds = [
+        
+    // ];
     const upperTierAreaIds = [
         1942, 1943, 1944, 1945, 1946, 1947, 1948, 1949, 1950, 1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960,
         1961, 1962, 1963, 1964, 1965, 1966, 1967, 1968, 1969, 1970, 1971, 1972, 1973, 1974, 1975, 1976, 1977, 1978, 1979, 1980,
@@ -866,8 +872,18 @@ async function checkOnce() {
     } else if (lockRes.status === 400 || lockRes.status === 404) {
         console.warn('[CS] lock got 400/404, likely issue with verification token or no seats available');
         
+        //get response html text only not html and also send in discord message
+        lockResponseHtmlText = await lockRes.text();
+        //get only text
+        lockResponseHtmlText = lockResponseHtmlText.replace(/<[^>]*>?/g, '');
+        //remove all break lines or \n from text
+        lockResponseHtmlText = lockResponseHtmlText.replace(/\n/g, '');
+        console.log('[CS] lock response html text', lockResponseHtmlText);
+
+        //send to background for error webhook dispatch
+        
         // Send webhook message about the failure
-        const errorMessage = `🎫 Seat with areaId ${areaId} and priceBandId ${priceBandId} found but not able to Lock them for Event ${monitor.eventId}. Status: ${lockRes.status}`;
+        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}. Response text: ${lockResponseHtmlText}`;
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
             message: errorMessage,
@@ -939,6 +955,8 @@ async function checkOnce() {
             return;
         }
         console.log('[CS] add to basket status', putRes.status);
+       
+
 
     }
 

@@ -129,38 +129,39 @@ async function pollSheetAndControl() {
                 notifyTabStop();
             }
         }
-        //else if current status is on, make sure the two tabs are open else re open them
-        else if (currentStatus === 'on') {
-            if (tabsOpenRecheckCount >= 48) {// 48 * 5 seconds = 2 minutes
-                tabsOpenRecheckCount = 0;
-                console.log('[BG] on 4 minutes re check , Current status is ON, checking if tabs are open');
-                //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
+        // no need for below code as heart beat is already handling this
+        // //else if current status is on, make sure the two tabs are open else re open them
+        // else if (currentStatus === 'on') {
+        //     if (tabsOpenRecheckCount >= 48) {// 48 * 5 seconds = 2 minutes
+        //         tabsOpenRecheckCount = 0;
+        //         console.log('[BG] on 4 minutes re check , Current status is ON, checking if tabs are open');
+        //         //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
 
-                //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
-                const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
-                const eventTabs = tabs.filter(t => t.url && t.url.startsWith(EVENT_URL));
-                const notAllowedTabs = tabs.filter(t => t.url && t.url.startsWith(EVENT_NOT_ALLOWED_URL));
-                if (eventTabs.length === 0) {
-                    console.log('[BG] No event tab found on 2 minutes recheck, opening new one');
-                    await openOrFocusTabs(EVENT_URL, undefined);
-                } else {
-                    console.log('[BG] Event tab already open on 2 minutes recheck', eventTabs[0].id);
-                }
-                if (notAllowedTabs.length === 0) {
-                    console.log('[BG] No EventNotAllowed tab found on 2 minutes recheck, opening new one');
-                    await openOrFocusTabs(undefined, EVENT_NOT_ALLOWED_URL);
-                } else {
-                    console.log('[BG] EventNotAllowed tab already open on 2 minutes recheck', notAllowedTabs[0].id);
-                }
-                // Close other eticketing tabs
-                await closeOtherEticketingTabs();
-                //wait for 5 seconds
-                await new Promise(resolve => setTimeout(resolve, 60000));
+        //         //check if there are two tabs with EVENT_URL and EVENT_NOT_ALLOWED_URL
+        //         const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
+        //         const eventTabs = tabs.filter(t => t.url && t.url.startsWith(EVENT_URL));
+        //         const notAllowedTabs = tabs.filter(t => t.url && t.url.startsWith(EVENT_NOT_ALLOWED_URL));
+        //         if (eventTabs.length === 0) {
+        //             console.log('[BG] No event tab found on 2 minutes recheck, opening new one');
+        //             await openOrFocusTabs(EVENT_URL, undefined);
+        //         } else {
+        //             console.log('[BG] Event tab already open on 2 minutes recheck', eventTabs[0].id);
+        //         }
+        //         if (notAllowedTabs.length === 0) {
+        //             console.log('[BG] No EventNotAllowed tab found on 2 minutes recheck, opening new one');
+        //             await openOrFocusTabs(undefined, EVENT_NOT_ALLOWED_URL);
+        //         } else {
+        //             console.log('[BG] EventNotAllowed tab already open on 2 minutes recheck', notAllowedTabs[0].id);
+        //         }
+        //         // Close other eticketing tabs
+        //         await closeOtherEticketingTabs();
+        //         //wait for 5 seconds
+        //         await new Promise(resolve => setTimeout(resolve, 60000));
 
 
-            }
-            tabsOpenRecheckCount++;
-        }
+        //     }
+        //     tabsOpenRecheckCount++;
+        // }
     } catch (e) {
         console.warn('[BG] pollSheetAndControl error:', e);
     }
@@ -329,7 +330,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "heartbeat" && sender.tab?.id) {
         heartbeatTracker[sender.tab.id] = Date.now();
-        console.log(`[BG] Heartbeat received from tab ${sender.tab.id}`);
+        console.log(`[BG] Heartbeat received from tab ${sender.tab.id} at ${new Date().toLocaleTimeString()}`);
     }
     return true;
 });
@@ -399,6 +400,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             if (foundEventTab) {
                 console.log('[BG] Found existing event tab, reloading', foundEventTab.id);
                 eventTabId = foundEventTab.id;
+                // Clear heartbeat tracking for this tab before reloading
+                clearHeartbeatTracking(eventTabId);
                 await chrome.tabs.reload(eventTabId);
                 await chrome.tabs.update(eventTabId, {active: true});
             } else {
@@ -406,6 +409,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 await chrome.tabs.update(eventTabId, {active: true});
                 console.log('[BG] Created event tab', created.id);
                 eventTabId = created.id;
+                // Clear any existing heartbeat tracking for new tab
+                clearHeartbeatTracking(eventTabId);
             }
             // //wait for 50 seconds here
             await new Promise(resolve => setTimeout(resolve, 60000));
@@ -419,11 +424,15 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             if (foundNotAllowed) {
                 console.log('[BG] Found existing validation tab, reloading', foundNotAllowed.id);
                 notAllowedTabId = foundNotAllowed.id;
+                // Clear heartbeat tracking for this tab before reloading
+                clearHeartbeatTracking(notAllowedTabId);
                 await chrome.tabs.reload(notAllowedTabId);
             } else {
                 const created2 = await chrome.tabs.create({url: EVENT_NOT_ALLOWED_URL, active: false});
                 console.log('[BG] Created validation tab', created2.id);
                 notAllowedTabId = created2.id;
+                // Clear any existing heartbeat tracking for new tab
+                clearHeartbeatTracking(notAllowedTabId);
             }
         }
 
@@ -471,6 +480,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Event tab closed, reopening...');
                 const created = await chrome.tabs.create({url: eventUrl, active: false});
                 eventTabId = created.id;
+                // Clear any existing heartbeat tracking for new tab
+                clearHeartbeatTracking(eventTabId);
             }
             //wait for 5 seconds here
             await new Promise(resolve => setTimeout(resolve, 60000));
@@ -482,6 +493,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Validation tab closed, reopening...');
                 const created2 = await chrome.tabs.create({url: EVENT_NOT_ALLOWED_URL, active: false});
                 notAllowedTabId = created2.id;
+                // Clear any existing heartbeat tracking for new tab
+                clearHeartbeatTracking(notAllowedTabId);
             
                 //wait for 5 seconds
                 await new Promise(resolve => setTimeout(resolve, 60000));
@@ -836,27 +849,69 @@ async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
 
 // Store last heartbeat times per tab
 const heartbeatTracker = {};
-const HEARTBEAT_TIMEOUT = 120000; // 60 sec
-const HEARTBEAT_CHECK_INTERVAL = 10000; // check every 5 sec
+const HEARTBEAT_TIMEOUT = 180000; // 3 minutes (180 seconds)
+const HEARTBEAT_CHECK_INTERVAL = 10000; // check every 10 seconds
 
 function reloadTabs(tabId) {
     console.warn(`[BG] Reloading tab ${tabId} due to no heartbeat`);
     chrome.tabs.reload(tabId);
 }
 
+// Helper function to clear heartbeat tracking for specific tabs or all tabs
+function clearHeartbeatTracking(tabIds = null) {
+    if (tabIds === null) {
+        // Clear all heartbeat tracking
+        console.log(`[BG] 🧹 Clearing all heartbeat tracking`);
+        Object.keys(heartbeatTracker).forEach(id => {
+            delete heartbeatTracker[id];
+        });
+    } else {
+        // Clear specific tab IDs
+        const idsArray = Array.isArray(tabIds) ? tabIds : [tabIds];
+        idsArray.forEach(id => {
+            if (heartbeatTracker[id]) {
+                console.log(`[BG] 🧹 Clearing heartbeat tracking for tab ${id}`);
+                delete heartbeatTracker[id];
+            }
+        });
+    }
+}
+
 
 // Periodically check for missing heartbeats
-setInterval(async () => { // <-- make this async
+setInterval(async () => {
     const now = Date.now();
+    const timeoutMs = HEARTBEAT_TIMEOUT;
+    const timeoutMinutes = timeoutMs / 60000;
+    
     for (const [tabId, lastTime] of Object.entries(heartbeatTracker)) {
-
-        if (now - lastTime > HEARTBEAT_TIMEOUT) {
-            console.log(`[BG] Checking heartbeat for tab ${tabId}, last time: ${new Date(lastTime).toLocaleTimeString()}`);
+        const timeSinceLastHeartbeat = now - lastTime;
+        
+        if (timeSinceLastHeartbeat > timeoutMs) {
+            console.log(`[BG] ⚠️ Heartbeat timeout for tab ${tabId}`);
+            console.log(`[BG] Last heartbeat: ${new Date(lastTime).toLocaleTimeString()}`);
+            console.log(`[BG] Time since last heartbeat: ${Math.round(timeSinceLastHeartbeat / 1000)}s (timeout: ${timeoutMinutes}min)`);
+            
             if (lastStatus === "on") {
-                console.log("Hearbeats were missed, reloading or re opening both tabs")
+                console.log(`[BG] 🔄 No heartbeat received in ${timeoutMinutes} minutes, reloading tabs...`);
+                
+                // Clear all heartbeat tracking before reloading to start fresh
+                clearHeartbeatTracking();
+                
                 await openOrFocusTabs(EVENT_URL, EVENT_NOT_ALLOWED_URL);
+                
+                console.log(`[BG] ✅ Tabs reloaded, heartbeat tracking reset. New 3-minute countdown started.`);
+            } else {
+                console.log(`[BG] Status is off, not reloading tabs`);
             }
+            
             delete heartbeatTracker[tabId]; // Stop tracking until new heartbeat
+        } else {
+            // Log heartbeat status for debugging (only every 30 seconds to avoid spam)
+            const timeSinceLastCheck = timeSinceLastHeartbeat;
+            if (timeSinceLastCheck % 30000 < HEARTBEAT_CHECK_INTERVAL) {
+                console.log(`[BG] ✅ Tab ${tabId} heartbeat OK (${Math.round(timeSinceLastHeartbeat / 1000)}s ago)`);
+            }
         }
     }
 }, HEARTBEAT_CHECK_INTERVAL);
