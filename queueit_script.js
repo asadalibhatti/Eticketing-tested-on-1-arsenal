@@ -5,7 +5,6 @@ console.log("[QueueIt Script] Script loaded on:", window.location.href);
 if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net")) {
     console.log("[QueueIt Script] Running on the correct page.");
 
-    // Wait for page to be fully loaded before starting
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', startQueueItScript);
     } else {
@@ -14,14 +13,19 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
 
     function startQueueItScript() {
         console.log("[QueueIt Script] Starting queue-it script...");
-        
+
         let checkCount = 0;
-        const maxChecks = 150; // Stop after 30 seconds (150 * 200ms)
-        
+        const maxChecks = 200; // slight increase since we wait up to 28s
+        let recaptchaTimeout;
+        const startTime = Date.now();
+        let iframeFound = false;
+        let cookiesCleared = false;
+        let redirectClicked = false;
+
         const checkElements = setInterval(async () => {
             checkCount++;
-            
-            // Stop checking after max attempts to prevent infinite loops
+            const elapsed = (Date.now() - startTime) / 1000;
+
             if (checkCount > maxChecks) {
                 console.log("[QueueIt Script] Stopping checks after max attempts");
                 clearInterval(checkElements);
@@ -30,29 +34,65 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
 
             const captchaInput = document.querySelector('input#solution');
             const robotButton = document.querySelector('button.botdetect-button');
-            // <button id="buttonConfirmRedirect" type="button" class="btn" data-bind="click: setActiveClient"><span class="l">Yes, please</span><span class="r">&nbsp;</span></button>
-
             const confirmRedirectButton = document.querySelector('button#buttonConfirmRedirect');
+            const recaptchaIframe = document.querySelector('iframe[title="recaptcha challenge expires in two minutes"]');
 
-            // Check for the confirm redirect button first
-            if (confirmRedirectButton) {// yes please button
-                console.log("[QueueIt Script] Confirm redirect button found.");
+            // --- Detect reCAPTCHA iframe ---
+            if (recaptchaIframe) {
+                if (!iframeFound) console.log("[QueueIt Script] reCAPTCHA challenge detected, waiting for auto-solve...");
+                iframeFound = true;
+
+                if (recaptchaTimeout) clearTimeout(recaptchaTimeout);
+                recaptchaTimeout = setTimeout(async () => {
+                    console.log("[QueueIt Script] reCAPTCHA not solved in 30s. Clearing cookies and refreshing...");
+                    clearInterval(checkElements);
+
+                    chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
+                    //delay 2 seconds
+                    await delay(2000);
+
+
+                    // Refresh again
+                    chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
+                        if (chrome.runtime.lastError) {
+                            console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
+                        } else {
+                            console.log('[CS] refreshEventTab response:', response);
+                        }
+                    });
+                    //delay 60 seconds
+                    await delay(60000);
+
+
+                }, 30000); // wait 30 sec after iframe appears
+            }
+
+            // --- If iframe not found within 25s, clear cookies & reload ---
+            if (!iframeFound && !cookiesCleared && elapsed >= 50) {
+                cookiesCleared = true;
+                console.log("[QueueIt Script] No reCAPTCHA iframe in 50s. Clearing cookies and reloading...");
+
                 clearInterval(checkElements);
-                //wait for 5 seconds
-                // await new Promise(resolve => setTimeout(resolve, 100000));
-                //click the confirm redirect button
-                confirmRedirectButton.click();
-                //wait for 60 seconds
-                console.log("[QueueIt Script] Waiting for 120 seconds...");
-                await new Promise(resolve => setTimeout(resolve, 120000));
-
-                //click the confirm redirect button
-                confirmRedirectButton.click();
-
+                const { eventUrl } = await chrome.storage.local.get("eventUrl");
+                chrome.runtime.sendMessage({ action: "clearCookiesAndRefresh" }, (response) => {
+                    console.log("[QueueIt Script] Cookies cleared response:", response);
+                    if (eventUrl) window.location.href = eventUrl;
+                });
                 return;
             }
 
-            // Original captcha handling
+            // --- Handle confirm redirect button only after 28s ---
+            if (elapsed >= 90 && confirmRedirectButton && !redirectClicked) {
+                redirectClicked = true;
+                console.log("[QueueIt Script] Confirm redirect button found (after 90s). Clicking...");
+
+                clearInterval(checkElements);
+                await new Promise(resolve => setTimeout(resolve, 100000)); // wait 100s if needed
+                confirmRedirectButton.click();
+                return;
+            }
+
+            // --- Handle captcha input ---
             if (captchaInput && robotButton) {
                 console.log("[QueueIt Script] Captcha input and button found.");
                 clearInterval(checkElements);
@@ -64,7 +104,7 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
                     }
                 });
             }
-        }, 200); // check every 200ms for faster response
+        }, 1000);
     }
 } else {
     console.log("[QueueIt Script] Not running - URL doesn't match queue-it pattern");

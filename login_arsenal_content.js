@@ -91,8 +91,12 @@ console.log('[LOGIN] Arsenal login content script loaded on', location.href);
         await new Promise(resolve => setTimeout(resolve, 1500));
         
         // Use specific credentials
-        const currentEmail = 'spiderlikmon@gmail.com';
-        const currentPassword = 'Mooga6137g';
+        // const currentEmail = 'spiderlikmon@gmail.com';
+        // const currentPassword = 'Mooga6137g';
+
+        const currentEmail = 'markjohnsondon7@gmail.com';
+        const currentPassword = 'Mooga613rt';
+
 
         // const currentEmail = 'Benjaminbusse0@gmail.com';
         // const currentPassword = 'Footballbusse38@';

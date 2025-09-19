@@ -38,6 +38,7 @@ let monitor = {
         console.warn('[CS] Not on eventId=4&reason=EventArchived page, stopping auto-start');
         return;
     }
+
     try {
         console.log('[CS] Auto-starting monitor on page load');
         await startMonitorFlow();
@@ -106,6 +107,12 @@ async function startMonitorFlow() {
                 monitor.startSecond = parseInt(row.StartSecond, 10) || monitor.startSecond;
                 monitor.areSeatsTogether = row.AreSeatsTogether === true || ('' + row.AreSeatsTogether).toLowerCase() === 'true';
                 monitor.quantity = parseInt(row.Quantity || '1', 10);
+                
+                // Save AreSeatsTogether and Quantity to local storage to avoid name mismatch
+                await chrome.storage.local.set({
+                    areSeatsTogether: monitor.areSeatsTogether,
+                    quantity: monitor.quantity
+                });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
             }
@@ -204,6 +211,7 @@ function scheduleNextCheck() {
     console.log(`[CS] Next check scheduled at ${nextRun.toLocaleTimeString()} (in ${(delay / 1000).toFixed(2)}s)`);
 
     setTimeout(runCheck, delay);
+    chrome.runtime.sendMessage({type: "heartbeat"});
 }
 
 async function runCheck() {
@@ -492,7 +500,7 @@ function shouldSendNotificationBasedOnSeats(basketData) {
 }
 
 async function checkOnce() {
-    chrome.runtime.sendMessage({type: "heartbeat"});
+    
 
     if (!monitor.running) return;
 
@@ -505,6 +513,12 @@ async function checkOnce() {
             monitor.eventUrl = matched_row.EventUrl || monitor.eventUrl;
             monitor.areSeatsTogether = matched_row.AreSeatsTogether === true || ('' + matched_row.AreSeatsTogether).toLowerCase() === 'true';
             monitor.quantity = parseInt(matched_row.Quantity || '1', 10);
+            
+            // Save AreSeatsTogether and Quantity to local storage to avoid name mismatch
+            await chrome.storage.local.set({
+                areSeatsTogether: monitor.areSeatsTogether,
+                quantity: monitor.quantity
+            });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
             console.log('[CS] sheet status', status);
@@ -620,7 +634,7 @@ async function checkOnce() {
                     }
                 });
 
-                await delay(120000);
+                await delay(80000);
                 consecutiveErrorCount = 0; // reset after refresh
                 return;
             }
@@ -651,7 +665,7 @@ async function checkOnce() {
                 }
             });
             //delay 50 seconds
-            await delay(50000);
+            await delay(70000);
         }
 
         // If reached 9 errors -> clear cookies + refresh
@@ -673,7 +687,7 @@ async function checkOnce() {
                 }
             });
             //wait for 70 seconds before next check
-            await delay(120000);
+            await delay(80000);
             notfound400erorsCount = 0; // reset error counter
 
 
@@ -883,7 +897,7 @@ async function checkOnce() {
         //send to background for error webhook dispatch
         
         // Send webhook message about the failure
-        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}. Response text: ${lockResponseHtmlText}`;
+        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}`;
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
             message: errorMessage,
@@ -913,17 +927,33 @@ async function checkOnce() {
             lockJson = null;
         }
 
-        const lockedSeat = lockJson?.LockedSeats?.[0];
-        if (!lockedSeat) {
+        const lockedSeats = lockJson?.LockedSeats;
+        if (!lockedSeats || lockedSeats.length === 0) {
             console.warn('[CS] no LockedSeats in response', lockJson);
             return;
         }
-        console.log('[CS] LockedSeat', lockedSeat);
+        console.log('[CS] LockedSeats', lockedSeats);
+
+        // Determine how many seats to add to basket
+        let seatsToAdd = [];
+        
+        if (monitor.areSeatsTogether && monitor.quantity > 1) {
+            // When seats together is true and quantity > 1, add all locked seats
+            seatsToAdd = lockedSeats.map(seat => ({
+                Id: seat.Id,
+                PriceClassId: 1
+            }));
+            console.log('[CS] Adding all locked seats to basket (areSeatsTogether=true, quantity=' + monitor.quantity + ')');
+        } else {
+            // When seats together is false or quantity is 1, add only the first seat
+            seatsToAdd = [{Id: lockedSeats[0].Id, PriceClassId: 1}];
+            console.log('[CS] Adding only first locked seat to basket (areSeatsTogether=' + monitor.areSeatsTogether + ', quantity=' + monitor.quantity + ')');
+        }
 
         // Adding to basket (PUT)
         const putBody = {
             EventId: monitor.eventId,
-            Seats: [{Id: lockedSeat.Id, PriceClassId: 1}]
+            Seats: seatsToAdd
         };
 
 
