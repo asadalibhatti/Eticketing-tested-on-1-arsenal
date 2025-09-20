@@ -317,7 +317,12 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 }
 
 let checksheet = true;//read sheet one time and not next and so on
-notfound400erorsCount = 0;
+
+// Separate error counters for different error types
+let error403Count = 0;           // For 403 Forbidden errors
+let tunnelTimeoutErrorCount = 0; // For tunnel connection and timeout errors
+let corsErrorCount = 0;          // For CORS errors
+let notfound400erorsCount = 0;   // For other HTTP errors (400, 401, 402, 302, 500)
 
 async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificationToken, endpointType = 'Regular') {
     console.log(`[INFO] Using ${endpointType} endpoint for direct add to basket`);
@@ -398,7 +403,7 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
     return successCount > 0; // True if at least one success
 }
 
-let consecutiveErrorCount = 0;  // track consecutive CORS or queue-it errors
+let queueItErrorCount = 0;  // track consecutive queue-it redirect errors
 
 function parseBasketHtml(html) {
     try {
@@ -590,45 +595,63 @@ async function checkOnce() {
             credentials: "include"
         });
 
-        // Reset consecutive error count on success
-        consecutiveErrorCount = 0;
+        // Reset queue-it error count on successful fetch
+        // queueItErrorCount = 0;
 
         // Detect if redirected to queue-it.net
         if (res.url.includes('queue-it.net')) {
-            console.warn('[CS] Redirected to queue-it.net');
+            queueItErrorCount++;
+            console.warn('[CS] Redirected to queue-it.net, count:', queueItErrorCount);
 
-            consecutiveErrorCount++;
-            if (consecutiveErrorCount >= 5) {
-                console.warn('[CS] 5 consecutive queue-it redirects, refreshing...');
+            if (queueItErrorCount >= 1) {
+                console.warn('[CS] 1 consecutive queue-it redirects (count:', queueItErrorCount, '), refreshing...');
 
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
                 await refreshEventTabWithTracking();
-                consecutiveErrorCount = 0; // reset after refresh
+                queueItErrorCount = 0; // reset after refresh
                 return;
             }
         } else {
             // If not queue-it redirect, reset count
-            consecutiveErrorCount = 0;
+            queueItErrorCount = 0;
         }
     } catch (e) {
         console.error('[CS] fetch seats error', e);
 
         // Detect CORS / Failed to fetch case
         if (e instanceof TypeError && e.message.includes('Failed to fetch')) {
-            console.warn('[CS] CORS or network error detected');
+            console.warn('[CS] Failed to fetch error detected');
 
-            consecutiveErrorCount++;
-            if (consecutiveErrorCount >= 2) {
-                console.warn('[CS] 2 consecutive CORS/network errors, refreshing...');
-
+            // Check if it's a CORS error by looking for queue-it.net in the error message or URL
+            if (e.message.includes('queue-it.net') || url.includes('queue-it.net')) {
+                // CORS error (first occurrence triggers refresh)
+                corsErrorCount++;
+                console.warn('[CS] CORS error detected (queue-it.net), count:', corsErrorCount);
+                
+                if (corsErrorCount === 1) {
+                    console.warn('[CS] First CORS error (count: 1), sending refresh request...');
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                await refreshEventTabWithTracking();
-                consecutiveErrorCount = 0; // reset after refresh
+                    await refreshEventTabWithTracking();
+                    corsErrorCount = 0; // reset after refresh
+                    return;
+                }
+            } else {
+                // Tunnel connection or timeout error
+                tunnelTimeoutErrorCount++;
+                console.warn('[CS] Tunnel connection or timeout error detected, count:', tunnelTimeoutErrorCount);
+                
+                // if (tunnelTimeoutErrorCount >= 6) {
+                //     console.warn('[CS] 6 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
+                //     chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
+                //     await refreshEventTabWithTracking();
+                //     tunnelTimeoutErrorCount = 0; // reset after refresh
+                // return;
+                // }
                 return;
             }
         } else {
             // reset on other errors
-            consecutiveErrorCount = 0;
+            queueItErrorCount = 0;
         }
 
         notfound400erorsCount++;
@@ -636,28 +659,57 @@ async function checkOnce() {
     }
 
     console.log('[CS] seats response status', res.status);
-    const errorStatuses = [400, 401, 402, 403, 302, 500];
+    
+    // Only reset all error counters on successful 200 status
+    if (res.status === 200) {
+        error403Count = 0;
+        tunnelTimeoutErrorCount = 0;
+        corsErrorCount = 0;
+        notfound400erorsCount = 0;
+        queueItErrorCount = 0;
+    }
+    
+    // Handle 403 errors separately
+    if (res.status === 403) {
+        error403Count++;
+        console.warn('[CS] received 403 Forbidden error from check seats availability API, count:', error403Count);
 
-    if (errorStatuses.includes(res.status)) {
-        console.warn('[CS] received error status from check seats availability API:', res.status);
+        // If reached 6 consecutive 403 errors -> refresh
+        if (error403Count >= 6) {
+            console.warn('[CS] 6 consecutive 403 errors (count:', error403Count, ') — refreshing tab.');
+            await refreshEventTabWithTracking();
+            error403Count = 0; // reset after refresh
+        }
+
+        // If reached 11 consecutive 403 errors -> clear cookies + refresh
+        if (error403Count >= 11) {
+            console.warn('[CS] 11 consecutive 403 errors (count:', error403Count, ') — requesting cookie clear & refresh.');
+            chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
+            await delay(2000);
+            await refreshEventTabWithTracking();
+            error403Count = 0; // reset error counter
+        }
+
+        return;
+    }
+
+    // Handle other HTTP errors (400, 401, 402, 302, 500)
+    const otherErrorStatuses = [400, 401, 402, 302, 500];
+    if (otherErrorStatuses.includes(res.status)) {
         notfound400erorsCount++;
+        console.warn('[CS] received error status from check seats availability API:', res.status, ', count:', notfound400erorsCount);
 
-        // If reached 5 errors -> refresh
-        if (notfound400erorsCount === 3) {
-            console.warn('[CS] 3 consecutive errors — refreshing tab.');
+        // If reached 4 errors -> refresh
+        if (notfound400erorsCount === 4) {
+            console.warn('[CS] 4 consecutive other errors (count:', notfound400erorsCount, ') — refreshing tab.');
             await refreshEventTabWithTracking();
         }
 
-        // If reached 9 errors -> clear cookies + refresh
-        if (notfound400erorsCount >= 6) {
-            // Clear all cookies
-            console.warn('[CS] 11 or more consecutive errors — requesting cookie clear & refresh.');
-
+        // If reached 7 errors -> clear cookies + refresh
+        if (notfound400erorsCount >= 7) {
+            console.warn('[CS] 7 or more consecutive other errors (count:', notfound400erorsCount, ') — requesting cookie clear & refresh.');
             chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
-            //delay 2 seconds
             await delay(2000);
-
-            // Refresh again
             await refreshEventTabWithTracking();
             notfound400erorsCount = 0; // reset error counter
         }
@@ -674,8 +726,7 @@ async function checkOnce() {
         return;
     }
 
-// ✅ Reset error counter ONLY on valid JSON data
-    notfound400erorsCount = 0;
+// ✅ All error counters already reset above on 200 status
 
     if (!Array.isArray(data) || data.length === 0) {
         //after waitMs
