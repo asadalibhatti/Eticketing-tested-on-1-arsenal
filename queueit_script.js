@@ -34,7 +34,6 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
 
             const captchaInput = document.querySelector('input#solution');
             const robotButton = document.querySelector('button.botdetect-button');
-            const confirmRedirectButton = document.querySelector('button#buttonConfirmRedirect');
             const recaptchaIframe = document.querySelector('iframe[title="recaptcha challenge expires in two minutes"]');
 
             // --- Detect reCAPTCHA iframe ---
@@ -81,14 +80,18 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
                 return;
             }
 
-            // --- Handle confirm redirect button only after 28s ---
-            if (elapsed >= 90 && confirmRedirectButton && !redirectClicked) {
+            // --- Handle "Yes, please" button immediately when found ---
+            const yesPleaseButton = document.querySelector('button#buttonConfirmRedirect span.l');
+            if (yesPleaseButton && yesPleaseButton.textContent.trim() === 'Yes, please' && !redirectClicked) {
                 redirectClicked = true;
-                console.log("[QueueIt Script] Confirm redirect button found (after 90s). Clicking...");
-
+                console.log("[QueueIt Script] 'Yes, please' button found. Clicking immediately...");
+                
                 clearInterval(checkElements);
-                await new Promise(resolve => setTimeout(resolve, 100000)); // wait 100s if needed
-                confirmRedirectButton.click();
+                // Click the parent button element
+                const parentButton = yesPleaseButton.closest('button');
+                if (parentButton) {
+                    parentButton.click();
+                }
                 return;
             }
 

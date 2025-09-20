@@ -622,17 +622,27 @@ async function checkOnce() {
         if (e instanceof TypeError && e.message.includes('Failed to fetch')) {
             console.warn('[CS] Failed to fetch error detected');
 
-            // Check if it's a CORS error by looking for queue-it.net in the error message or URL
-            if (e.message.includes('queue-it.net') || url.includes('queue-it.net')) {
-                // CORS error (first occurrence triggers refresh)
-                corsErrorCount++;
-                console.warn('[CS] CORS error detected (queue-it.net), count:', corsErrorCount);
+            // Since we can't access the full CORS error message from the error object,
+            // we need to use heuristics to detect queue-it CORS errors.
+            // Queue-it CORS errors typically occur when:
+            // 1. The request fails with "Failed to fetch" 
+            // 2. We're making a request to eticketing.co.uk (which can redirect to queue-it.net)
+            // 3. The error happens during a seat availability check
+            
+            // Check if this is likely a queue-it CORS error by examining the URL pattern
+            const isEticketingRequest = url.includes('eticketing.co.uk') && 
+                                      (url.includes('/Seats/Available') || url.includes('/EDP/Seats/'));
+            
+            if (isEticketingRequest) {
+                // This is likely a queue-it CORS error - increment queueItErrorCount
+                queueItErrorCount++;
+                console.warn('[CS] Queue-it CORS error detected (eticketing request failed), count:', queueItErrorCount);
                 
-                if (corsErrorCount === 1) {
-                    console.warn('[CS] First CORS error (count: 1), sending refresh request...');
-                chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
+                if (queueItErrorCount >= 1) {
+                    console.warn('[CS] Queue-it CORS error (count:', queueItErrorCount, '), refreshing...');
+                    chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
                     await refreshEventTabWithTracking();
-                    corsErrorCount = 0; // reset after refresh
+                    queueItErrorCount = 0; // reset after refresh
                     return;
                 }
             } else {

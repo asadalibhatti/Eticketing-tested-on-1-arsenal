@@ -95,6 +95,11 @@ async function pollSheetAndControl() {
 
 
                     //save to local storage currentStatus
+                    console.log('[BG] Storing credentials from Google Sheets:', {
+                        loginEmail: row.loginEmail ? '***@' + row.loginEmail.split('@')[1] : 'NOT_SET',
+                        loginPassword: row.loginPassword ? '***' + row.loginPassword.slice(-2) : 'NOT_SET'
+                    });
+                    
                     await chrome.storage.local.set({
                         currentStatus: currentStatus,
                         eventUrl: row.eventUrl,
@@ -365,6 +370,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         updateHeartbeat();
         console.log(`[BG] Heartbeat received from tab ${sender.tab.id} at ${new Date().toLocaleTimeString()}`);
     }
+    if (msg.action === 'refetchCredentials') {
+        console.log('[BG] Refetching credentials from Google Sheets...');
+        refetchCredentialsFromSheet()
+            .then((result) => {
+                console.log('[BG] Credential refetch result:', result);
+                sendResponse({success: true, credentials: result});
+            })
+            .catch((error) => {
+                console.error('[BG] Credential refetch failed:', error);
+                sendResponse({success: false, error: error.message});
+            });
+        return true; // keep channel open for async response
+    }
     return true;
 });
 
@@ -403,6 +421,11 @@ async function startFlowFromStorage() {
             //     "minimumPrice": ""
             //     }
             // Save to local storage
+            console.log('[BG] Manual start - storing credentials from Google Sheets:', {
+                loginEmail: cfg.loginEmail ? '***@' + cfg.loginEmail.split('@')[1] : 'NOT_SET',
+                loginPassword: cfg.loginPassword ? '***' + cfg.loginPassword.slice(-2) : 'NOT_SET'
+            });
+            
             await chrome.storage.local.set({
                 sheetUrl: sheetUrl,
                 startSecond: cfg.startSecond,
@@ -771,7 +794,7 @@ async function fetchSheetConfigAll(sheetUrl) {
         //     "maximumprice": 10000000,
         //     "minimumprice": 0
         // }
-        return {
+        const result = {
             status: (map['status'] || '').toString().toLowerCase(),
             discordWebhook: map['discordwebhookurl'] || '',
             telegramWebhook: map['telegrambottoken'] || '',
@@ -783,12 +806,72 @@ async function fetchSheetConfigAll(sheetUrl) {
             eventId: map['eventid'] || '',
             maximumPrice: map['maximumprice'] || '',
             minimumPrice: map['minimumprice'] || '',
-            loginEmail: map['loginemail'] || '',
-            loginPassword: map['loginpassword'] || ''
+            loginEmail: (map['loginemail'] || '').toString().trim(),
+            loginPassword: (map['loginpassword'] || '').toString().trim()
         };
+        
+        // Log credential extraction for debugging
+        if (result.loginEmail || result.loginPassword) {
+            console.log('[BG] Extracted credentials from sheet row:', {
+                loginEmail: result.loginEmail ? '***@' + result.loginEmail.split('@')[1] : 'NOT_SET',
+                loginPassword: result.loginPassword ? '***' + result.loginPassword.slice(-2) : 'NOT_SET',
+                status: result.status
+            });
+        }
+        
+        return result;
     });
 
     return allRows;
+}
+
+async function refetchCredentialsFromSheet() {
+    try {
+        const data = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
+        const sheetUrl = data.sheetUrl;
+        const startSecond = data.startSecond;
+
+        if (!sheetUrl) {
+            throw new Error('No sheet URL found in storage');
+        }
+
+        console.log('[BG] Refetching credentials for startSecond:', startSecond);
+        
+        const allCfg = await fetchSheetConfigAll(sheetUrl);
+        
+        // Find the matching row based on startSecond
+        const matchingRow = allCfg.find(cfg => 
+            parseInt(cfg.startSecond, 10) === parseInt(startSecond, 10)
+        );
+
+        if (!matchingRow) {
+            throw new Error(`No matching row found for startSecond: ${startSecond}`);
+        }
+
+        if (!matchingRow.loginEmail || !matchingRow.loginPassword) {
+            throw new Error('Login credentials not found in matching row');
+        }
+
+        // Store the refetched credentials
+        await chrome.storage.local.set({
+            loginEmail: matchingRow.loginEmail,
+            loginPassword: matchingRow.loginPassword
+        });
+
+        console.log('[BG] Credentials refetched and stored:', {
+            loginEmail: matchingRow.loginEmail ? '***@' + matchingRow.loginEmail.split('@')[1] : 'NOT_SET',
+            loginPassword: matchingRow.loginPassword ? '***' + matchingRow.loginPassword.slice(-2) : 'NOT_SET'
+        });
+
+        return {
+            loginEmail: matchingRow.loginEmail,
+            loginPassword: matchingRow.loginPassword
+        };
+
+    } catch (error) {
+        console.error('[BG] Error refetching credentials:', error);
+        throw error;
+    }
 }
 
 // async function fetchSheetConfig(sheetUrl) {
