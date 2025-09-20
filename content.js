@@ -114,7 +114,9 @@ async function startMonitorFlow() {
                     areSeatsTogether: monitor.areSeatsTogether,
                     quantity: monitor.quantity,
                     loginEmail: row.LoginEmail || '',
-                    loginPassword: row.LoginPassword || ''
+                    loginPassword: row.LoginPassword || '',
+                    ignoreClubLevel: row.IgnoreClubLevel || row.ignoreClubLevel || '',
+                    ignoreUpperTier: row.IgnoreUpperTier || row.ignoreUpperTier || ''
                 });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
@@ -275,6 +277,7 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
         // Headers
         const headers = table.cols.map(c => (c.label || '').trim());
+        console.log('[CS] Available column names in Google Sheet:', headers);
 
         let rowMatchedButOff = false;
         // Iterate rows
@@ -299,7 +302,7 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
             }
             if (status === 'on' && sheetSecond === startSecond) {
-
+                console.log('[CS] Found matching row data:', rowData);
                 return rowData; // Found matching row
             }
 
@@ -528,7 +531,9 @@ async function checkOnce() {
                 areSeatsTogether: monitor.areSeatsTogether,
                 quantity: monitor.quantity,
                 loginEmail: matched_row.LoginEmail || '',
-                loginPassword: matched_row.LoginPassword || ''
+                loginPassword: matched_row.LoginPassword || '',
+                ignoreClubLevel: matched_row.IgnoreClubLevel || matched_row.ignoreClubLevel || '',
+                ignoreUpperTier: matched_row.IgnoreUpperTier || matched_row.ignoreUpperTier || ''
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
@@ -743,40 +748,55 @@ async function checkOnce() {
     console.log('[CS] Total areas found:', data.length);
     console.log('[CS] Area IDs found:', data.map(a => a.AreaId).join(', '));
     
+    // Get ignore settings from local storage
+    const { ignoreClubLevel, ignoreUpperTier } = await chrome.storage.local.get(['ignoreClubLevel', 'ignoreUpperTier']);
+    console.log('[CS] Filter settings - ignoreClubLevel:', ignoreClubLevel, 'ignoreUpperTier:', ignoreUpperTier);
+    
     // Filter out club level and upper tier areas (known area IDs for Arsenal Emirates Stadium)
     // upper tier range 1942-1988
     // lower tier range 1691-1941
     // Club level area IDs: 1647-1690
-    // const clubLevelAreaIds = [
-        
-    // ];
     const clubLevelAreaIds = [
         1647, 1648, 1649, 1650, 1651, 1652, 1653, 1654, 1655, 1656, 1657, 1658, 1659, 1660,
         1661, 1662, 1663, 1664, 1665, 1666, 1667, 1668, 1669, 1670, 1671, 1672, 1673, 1674, 1675, 1676, 1677, 1678, 1679, 1680,
         1681, 1682, 1683, 1684, 1685, 1686, 1687, 1688, 1689, 1690
     ];
     
-    // const upperTierAreaIds = [
-        
-    // ];
     const upperTierAreaIds = [
         1942, 1943, 1944, 1945, 1946, 1947, 1948, 1949, 1950, 1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960,
         1961, 1962, 1963, 1964, 1965, 1966, 1967, 1968, 1969, 1970, 1971, 1972, 1973, 1974, 1975, 1976, 1977, 1978, 1979, 1980,
         1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988
     ];
     
-    // Filter out club level and upper tier areas, keep only lower tier areas
-    const preferredAreas = data.filter(a => 
-        a.PriceBands && 
-        a.PriceBands.length && 
-        !clubLevelAreaIds.includes(a.AreaId) &&
-        !upperTierAreaIds.includes(a.AreaId)
-    );
+    // Apply conditional filtering based on ignore settings
+    // If ignoreClubLevel is "yes", filter out club level areas
+    // If ignoreUpperTier is "yes", filter out upper tier areas
+    const shouldIgnoreClubLevel = ignoreClubLevel && ignoreClubLevel.toLowerCase() === 'yes';
+    const shouldIgnoreUpperTier = ignoreUpperTier && ignoreUpperTier.toLowerCase() === 'yes';
     
-    console.log('[CS] Preferred areas found (lower tier only):', preferredAreas.length);
+    console.log('[CS] Filter logic - shouldIgnoreClubLevel:', shouldIgnoreClubLevel, 'shouldIgnoreUpperTier:', shouldIgnoreUpperTier);
+    
+    // Filter areas based on ignore settings
+    const preferredAreas = data.filter(a => {
+        if (!a.PriceBands || !a.PriceBands.length) return false;
+        
+        // If should ignore club level and this is a club level area, exclude it
+        if (shouldIgnoreClubLevel && clubLevelAreaIds.includes(a.AreaId)) {
+            return false;
+        }
+        
+        // If should ignore upper tier and this is an upper tier area, exclude it
+        if (shouldIgnoreUpperTier && upperTierAreaIds.includes(a.AreaId)) {
+            return false;
+        }
+        
+        return true;
+    });
+    
+    console.log('[CS] Preferred areas found after filtering:', preferredAreas.length);
     console.log('[CS] Preferred area IDs:', preferredAreas.map(a => a.AreaId).join(', '));
     
-    // If no preferred areas found, check what areas are available
+    // If no preferred areas found, check what areas are available and log the reason
     if (preferredAreas.length === 0) {
         const clubLevelAreas = data.filter(a => 
             a.PriceBands && 
@@ -791,12 +811,12 @@ async function checkOnce() {
         );
         
         if (clubLevelAreas.length > 0 || upperTierAreas.length > 0) {
-            console.log('[CS] Ignoring club level and upper tier tickets found with areas:');
-            if (clubLevelAreas.length > 0) {
-                console.log('[CS] Club level areas:', clubLevelAreas.map(a => a.AreaId).join(', '));
+            console.log('[CS] Filtered out areas based on ignore settings:');
+            if (clubLevelAreas.length > 0 && shouldIgnoreClubLevel) {
+                console.log('[CS] Club level areas filtered out (ignoreClubLevel=yes):', clubLevelAreas.map(a => a.AreaId).join(', '));
             }
-            if (upperTierAreas.length > 0) {
-                console.log('[CS] Upper tier areas:', upperTierAreas.map(a => a.AreaId).join(', '));
+            if (upperTierAreas.length > 0 && shouldIgnoreUpperTier) {
+                console.log('[CS] Upper tier areas filtered out (ignoreUpperTier=yes):', upperTierAreas.map(a => a.AreaId).join(', '));
             }
             return;
         }

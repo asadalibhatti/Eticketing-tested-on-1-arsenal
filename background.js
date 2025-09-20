@@ -108,7 +108,9 @@ async function pollSheetAndControl() {
                         maximumPrice: row.maximumPrice,
                         minimumPrice: row.minimumPrice,
                         loginEmail: row.loginEmail,
-                        loginPassword: row.loginPassword
+                        loginPassword: row.loginPassword,
+                        ignoreClubLevel: row.ignoreClubLevel,
+                        ignoreUpperTier: row.ignoreUpperTier
                     });
                     EVENT_URL = row.eventUrl;
 
@@ -419,7 +421,9 @@ async function refreshCredentialsFromSheet() {
     await chrome.storage.local.set({
         loginEmail: cfg.loginEmail,
         loginPassword: cfg.loginPassword,
-        currentStatus: 'on'
+        currentStatus: 'on',
+        ignoreClubLevel: cfg.ignoreClubLevel,
+        ignoreUpperTier: cfg.ignoreUpperTier
     });
 
     console.log('[BG] Credentials updated in local storage');
@@ -467,7 +471,9 @@ async function startFlowFromStorage() {
                 areSeatsTogether: cfg.areSeatsTogether === 'true', // convert to boolean
                 quantity: parseInt(cfg.quantity, 10) || 1,
                 loginEmail: cfg.loginEmail,
-                loginPassword: cfg.loginPassword
+                loginPassword: cfg.loginPassword,
+                ignoreClubLevel: cfg.ignoreClubLevel,
+                ignoreUpperTier: cfg.ignoreUpperTier
             });
 
             await openOrFocusTabs(cfg.eventUrl, EVENT_NOT_ALLOWED_URL);
@@ -840,7 +846,9 @@ async function fetchSheetConfigAll(sheetUrl) {
             maximumPrice: map['maximumprice'] || '',
             minimumPrice: map['minimumprice'] || '',
             loginEmail: map['loginemail'] || '',
-            loginPassword: map['loginpassword'] || ''
+            loginPassword: map['loginpassword'] || '',
+            ignoreClubLevel: map['ignoreclublevel'] || '',
+            ignoreUpperTier: map['ignoreuppertier'] || ''
         };
     });
 
