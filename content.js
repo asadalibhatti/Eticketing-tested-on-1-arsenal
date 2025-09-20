@@ -1,5 +1,6 @@
 console.log('TICKET Checking content script loaded on', location.href);
 
+
 if (document.title.includes("Your Browsing Activity Has")) {
     console.log("[CS] Waiting for tab title to change...");
     let checkTitleInterval = setInterval(() => {
@@ -622,42 +623,33 @@ async function checkOnce() {
         if (e instanceof TypeError && e.message.includes('Failed to fetch')) {
             console.warn('[CS] Failed to fetch error detected');
 
-            // Since we can't access the full CORS error message from the error object,
-            // we need to use heuristics to detect queue-it CORS errors.
-            // Queue-it CORS errors typically occur when:
-            // 1. The request fails with "Failed to fetch" 
-            // 2. We're making a request to eticketing.co.uk (which can redirect to queue-it.net)
-            // 3. The error happens during a seat availability check
+            // We need to distinguish between different types of "Failed to fetch" errors:
+            // 1. CORS errors: Usually happen when redirected to queue-it.net
+            // 2. Tunnel connection errors: Network connectivity issues (ERR_TUNNEL_CONNECTION_FAILED)
+            // 3. Other network errors: Timeouts, DNS issues, etc.
             
-            // Check if this is likely a queue-it CORS error by examining the URL pattern
-            const isEticketingRequest = url.includes('eticketing.co.uk') && 
-                                      (url.includes('/Seats/Available') || url.includes('/EDP/Seats/'));
+            // The challenge is that both CORS and tunnel errors result in "Failed to fetch"
+            // but have different underlying causes. Since we can't access the detailed error
+            // from the JavaScript error object, we need a different approach.
             
-            if (isEticketingRequest) {
-                // This is likely a queue-it CORS error - increment queueItErrorCount
-                queueItErrorCount++;
-                console.warn('[CS] Queue-it CORS error detected (eticketing request failed), count:', queueItErrorCount);
-                
-                if (queueItErrorCount >= 1) {
-                    console.warn('[CS] Queue-it CORS error (count:', queueItErrorCount, '), refreshing...');
-                    chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                    await refreshEventTabWithTracking();
-                    queueItErrorCount = 0; // reset after refresh
-                    return;
-                }
-            } else {
-                // Tunnel connection or timeout error
-                tunnelTimeoutErrorCount++;
-                console.warn('[CS] Tunnel connection or timeout error detected, count:', tunnelTimeoutErrorCount);
-                
-                // if (tunnelTimeoutErrorCount >= 6) {
-                //     console.warn('[CS] 6 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
-                //     chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                //     await refreshEventTabWithTracking();
-                //     tunnelTimeoutErrorCount = 0; // reset after refresh
-                // return;
-                // }
-                return;
+            // One approach is to use timing or other heuristics, but for now,
+            // let's be more conservative and treat most "Failed to fetch" errors as
+            // tunnel/network errors, unless we have strong evidence they're CORS errors.
+            
+            // We'll only treat as CORS errors if we can definitively identify them.
+            // For now, let's treat all "Failed to fetch" as tunnel errors to avoid
+            // false positives, and rely on the redirect detection logic above
+            // to catch actual CORS errors.
+            
+            tunnelTimeoutErrorCount++;
+            console.warn('[CS] Cors or network or Tunnel connection or timeout error detected, count:', tunnelTimeoutErrorCount);
+            
+            if (tunnelTimeoutErrorCount >= 2) {
+                console.warn('[CS] 2 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
+                chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
+                await refreshEventTabWithTracking();
+                tunnelTimeoutErrorCount = 0; // reset after refresh
+            return;
             }
         } else {
             // reset on other errors
@@ -692,8 +684,8 @@ async function checkOnce() {
         }
 
         // If reached 11 consecutive 403 errors -> clear cookies + refresh
-        if (error403Count >= 11) {
-            console.warn('[CS] 11 consecutive 403 errors (count:', error403Count, ') — requesting cookie clear & refresh.');
+        if (error403Count >= 9) {
+            console.warn('[CS] 9 consecutive 403 errors (count:', error403Count, ') — requesting cookie clear & refresh.');
             chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
             await delay(2000);
             await refreshEventTabWithTracking();
@@ -1354,7 +1346,7 @@ function delay(ms) {
 }
 
 // Helper function to wait for event tab reload completion
-async function waitForEventTabReload(timeoutMs = 120000) {
+async function waitForEventTabReload(timeoutMs = 140000) {
     console.log('[CS] Waiting for event tab reload completion...');
     
     const startTime = Date.now();

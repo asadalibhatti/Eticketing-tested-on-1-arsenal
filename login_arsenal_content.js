@@ -70,6 +70,54 @@ console.log('[LOGIN] Arsenal login content script loaded on', location.href);
         console.log('[LOGIN] Login process stopped');
     }
     
+    async function getLoginCredentials() {
+        console.log('[LOGIN] Retrieving login credentials from Google Sheets...');
+        
+        // First, try to get credentials from local storage
+        const { loginEmail, loginPassword, currentStatus } = await chrome.storage.local.get(['loginEmail', 'loginPassword', 'currentStatus']);
+        
+        if (loginEmail && loginPassword) {
+            console.log('[LOGIN] Found credentials in local storage from Google Sheets');
+            return { email: loginEmail, password: loginPassword };
+        }
+        
+        // If no credentials found, check if the system is active
+        if (currentStatus !== 'on') {
+            throw new Error('System is not active. Please ensure your Google Sheet has a row with status "on" and matching startSecond.');
+        }
+        
+        // Request background script to refresh credentials from Google Sheets
+        console.log('[LOGIN] No credentials found, requesting background script to refresh from Google Sheets...');
+        
+        try {
+            // Send message to background script to refresh credentials
+            const response = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage({ action: 'refreshCredentials' }, (response) => {
+                    if (chrome.runtime.lastError) {
+                        reject(new Error(chrome.runtime.lastError.message));
+                    } else {
+                        resolve(response);
+                    }
+                });
+            });
+            
+            if (response && response.success) {
+                // Try again to get credentials after refresh
+                const { loginEmail: refreshedEmail, loginPassword: refreshedPassword } = await chrome.storage.local.get(['loginEmail', 'loginPassword']);
+                
+                if (refreshedEmail && refreshedPassword) {
+                    console.log('[LOGIN] Successfully retrieved credentials after refresh');
+                    return { email: refreshedEmail, password: refreshedPassword };
+                }
+            }
+        } catch (error) {
+            console.warn('[LOGIN] Failed to refresh credentials from background script:', error);
+        }
+        
+        // Final fallback - throw error
+        throw new Error('Login credentials not available from Google Sheets. Please check:\n1. Your Google Sheet has a row with status "on"\n2. The row has valid loginEmail and loginPassword columns\n3. The startSecond matches your configuration\n4. The Google Sheet URL is correctly configured');
+    }
+    
     async function performLogin() {
         console.log('[LOGIN] Performing login...');
         
@@ -90,67 +138,12 @@ console.log('[LOGIN] Arsenal login content script loaded on', location.href);
         // Wait a bit for autofill to complete
         await new Promise(resolve => setTimeout(resolve, 1500));
         
-        // Get login credentials from local storage (fetched from Google Sheets by background script)
-        // The background script polls the Google Sheet and stores loginEmail and loginPassword
-        // in Chrome's local storage. These credentials are retrieved here for login.
-        let { loginEmail, loginPassword } = await chrome.storage.local.get(['loginEmail', 'loginPassword']);
-        
-        // Validate credentials from Google Sheets
-        if (!loginEmail || !loginPassword) {
-            console.warn('[LOGIN] No login credentials found in local storage from Google Sheets');
-            console.log('[LOGIN] Attempting to refetch credentials from Google Sheets...');
-            
-            try {
-                const refetchResult = await new Promise((resolve, reject) => {
-                    chrome.runtime.sendMessage({action: 'refetchCredentials'}, (response) => {
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                        } else if (response && response.success) {
-                            resolve(response.credentials);
-                        } else {
-                            reject(new Error(response?.error || 'Failed to refetch credentials'));
-                        }
-                    });
-                });
-                
-                console.log('[LOGIN] Credentials refetched successfully');
-                // Use the refetched credentials
-                const { loginEmail: refetchedEmail, loginPassword: refetchedPassword } = refetchResult;
-                
-                if (!refetchedEmail || !refetchedPassword) {
-                    throw new Error('Refetched credentials are still empty');
-                }
-                
-                // Update the variables to use refetched credentials
-                loginEmail = refetchedEmail;
-                loginPassword = refetchedPassword;
-                
-                // Add a small delay to ensure credentials are properly stored
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                
-            } catch (refetchError) {
-                console.error('[LOGIN] Failed to refetch credentials:', refetchError);
-                console.error('[LOGIN] Please ensure your Google Sheet has loginEmail and loginPassword columns with valid data');
-                throw new Error(`Login credentials not available from Google Sheets. Refetch failed: ${refetchError.message}`);
-            }
-        }
-        
-        // Validate email format
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(loginEmail)) {
-            console.error('[LOGIN] Invalid email format in Google Sheets:', loginEmail);
-            throw new Error('Invalid email format in Google Sheets. Please check your loginEmail column.');
-        }
-        
-        // Validate password is not empty
-        if (loginPassword.trim().length === 0) {
-            console.error('[LOGIN] Empty password in Google Sheets');
-            throw new Error('Empty password in Google Sheets. Please check your loginPassword column.');
-        }
+        // Get login credentials from local storage (from Google Sheets)
+        const credentials = await getLoginCredentials();
         
         console.log('[LOGIN] Using credentials from Google Sheets, filling form fields...');
-        const currentEmail = loginEmail.trim();
-        const currentPassword = loginPassword.trim();
+        const currentEmail = credentials.email;
+        const currentPassword = credentials.password;
         
         // Clear existing values first
         emailInput.value = '';

@@ -95,11 +95,6 @@ async function pollSheetAndControl() {
 
 
                     //save to local storage currentStatus
-                    console.log('[BG] Storing credentials from Google Sheets:', {
-                        loginEmail: row.loginEmail ? '***@' + row.loginEmail.split('@')[1] : 'NOT_SET',
-                        loginPassword: row.loginPassword ? '***' + row.loginPassword.slice(-2) : 'NOT_SET'
-                    });
-                    
                     await chrome.storage.local.set({
                         currentStatus: currentStatus,
                         eventUrl: row.eventUrl,
@@ -368,24 +363,67 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "heartbeat" ) {
         // heartbeatTracker[sender.tab.id] = Date.now();
         updateHeartbeat();
+        
         console.log(`[BG] Heartbeat received from tab ${sender.tab.id} at ${new Date().toLocaleTimeString()}`);
     }
-    if (msg.action === 'refetchCredentials') {
-        console.log('[BG] Refetching credentials from Google Sheets...');
-        refetchCredentialsFromSheet()
-            .then((result) => {
-                console.log('[BG] Credential refetch result:', result);
-                sendResponse({success: true, credentials: result});
+    if (msg.action === 'refreshCredentials') {
+        console.log('[BG] refreshCredentials requested from content script');
+        Promise.resolve(refreshCredentialsFromSheet())
+            .then(() => {
+                console.log('[BG] Credentials refreshed successfully');
+                sendResponse({success: true, message: 'Credentials refreshed from Google Sheets'});
             })
-            .catch((error) => {
-                console.error('[BG] Credential refetch failed:', error);
-                sendResponse({success: false, error: error.message});
+            .catch(err => {
+                console.error('[BG] refreshCredentials error:', err);
+                sendResponse({success: false, message: err?.message || 'Failed to refresh credentials'});
             });
         return true; // keep channel open for async response
     }
     return true;
 });
 
+
+async function refreshCredentialsFromSheet() {
+    console.log('[BG] Refreshing credentials from Google Sheets...');
+    
+    const data = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
+    const sheetUrl = data.sheetUrl;
+    const startSecond = data.startSecond ?? 2;
+
+    if (!sheetUrl) {
+        throw new Error('No Google Sheet URL configured');
+    }
+
+    const allCfg = await fetchSheetConfigAll(sheetUrl).catch(e => {
+        console.warn('[BG] fetch sheet failed', e);
+        throw new Error('Failed to fetch data from Google Sheets: ' + e.message);
+    });
+
+    console.log('[BG] Checking all rows for startSecond match:', startSecond);
+
+    // Find matching rows that are active
+    const matchingRows = allCfg.filter(cfg =>
+        ['on', 'start', 'true', '1'].includes((cfg.status || '').toString().trim().toLowerCase()) &&
+        parseInt(cfg.startSecond, 10) === parseInt(startSecond, 10)
+    );
+
+    if (matchingRows.length === 0) {
+        throw new Error(`No active row found with startSecond=${startSecond}. Please check your Google Sheet configuration.`);
+    }
+
+    // Use the first matching row
+    const cfg = matchingRows[0];
+    console.log('[BG] Found matching active row for credentials:', cfg);
+
+    // Update credentials in local storage
+    await chrome.storage.local.set({
+        loginEmail: cfg.loginEmail,
+        loginPassword: cfg.loginPassword,
+        currentStatus: 'on'
+    });
+
+    console.log('[BG] Credentials updated in local storage');
+}
 
 async function startFlowFromStorage() {
     const data = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
@@ -421,11 +459,6 @@ async function startFlowFromStorage() {
             //     "minimumPrice": ""
             //     }
             // Save to local storage
-            console.log('[BG] Manual start - storing credentials from Google Sheets:', {
-                loginEmail: cfg.loginEmail ? '***@' + cfg.loginEmail.split('@')[1] : 'NOT_SET',
-                loginPassword: cfg.loginPassword ? '***' + cfg.loginPassword.slice(-2) : 'NOT_SET'
-            });
-            
             await chrome.storage.local.set({
                 sheetUrl: sheetUrl,
                 startSecond: cfg.startSecond,
@@ -794,7 +827,7 @@ async function fetchSheetConfigAll(sheetUrl) {
         //     "maximumprice": 10000000,
         //     "minimumprice": 0
         // }
-        const result = {
+        return {
             status: (map['status'] || '').toString().toLowerCase(),
             discordWebhook: map['discordwebhookurl'] || '',
             telegramWebhook: map['telegrambottoken'] || '',
@@ -806,72 +839,12 @@ async function fetchSheetConfigAll(sheetUrl) {
             eventId: map['eventid'] || '',
             maximumPrice: map['maximumprice'] || '',
             minimumPrice: map['minimumprice'] || '',
-            loginEmail: (map['loginemail'] || '').toString().trim(),
-            loginPassword: (map['loginpassword'] || '').toString().trim()
+            loginEmail: map['loginemail'] || '',
+            loginPassword: map['loginpassword'] || ''
         };
-        
-        // Log credential extraction for debugging
-        if (result.loginEmail || result.loginPassword) {
-            console.log('[BG] Extracted credentials from sheet row:', {
-                loginEmail: result.loginEmail ? '***@' + result.loginEmail.split('@')[1] : 'NOT_SET',
-                loginPassword: result.loginPassword ? '***' + result.loginPassword.slice(-2) : 'NOT_SET',
-                status: result.status
-            });
-        }
-        
-        return result;
     });
 
     return allRows;
-}
-
-async function refetchCredentialsFromSheet() {
-    try {
-        const data = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
-        const sheetUrl = data.sheetUrl;
-        const startSecond = data.startSecond;
-
-        if (!sheetUrl) {
-            throw new Error('No sheet URL found in storage');
-        }
-
-        console.log('[BG] Refetching credentials for startSecond:', startSecond);
-        
-        const allCfg = await fetchSheetConfigAll(sheetUrl);
-        
-        // Find the matching row based on startSecond
-        const matchingRow = allCfg.find(cfg => 
-            parseInt(cfg.startSecond, 10) === parseInt(startSecond, 10)
-        );
-
-        if (!matchingRow) {
-            throw new Error(`No matching row found for startSecond: ${startSecond}`);
-        }
-
-        if (!matchingRow.loginEmail || !matchingRow.loginPassword) {
-            throw new Error('Login credentials not found in matching row');
-        }
-
-        // Store the refetched credentials
-        await chrome.storage.local.set({
-            loginEmail: matchingRow.loginEmail,
-            loginPassword: matchingRow.loginPassword
-        });
-
-        console.log('[BG] Credentials refetched and stored:', {
-            loginEmail: matchingRow.loginEmail ? '***@' + matchingRow.loginEmail.split('@')[1] : 'NOT_SET',
-            loginPassword: matchingRow.loginPassword ? '***' + matchingRow.loginPassword.slice(-2) : 'NOT_SET'
-        });
-
-        return {
-            loginEmail: matchingRow.loginEmail,
-            loginPassword: matchingRow.loginPassword
-        };
-
-    } catch (error) {
-        console.error('[BG] Error refetching credentials:', error);
-        throw error;
-    }
 }
 
 // async function fetchSheetConfig(sheetUrl) {
