@@ -3,13 +3,7 @@ console.log("requestVerification script loaded, on", location.href);
 if (window.location.pathname.includes("/EDP/Event/Index/")) {
 
     console.log("[CS] Reloading page after 120 minutes interval.");
-    // Reload the page every 120 minutes
-    setInterval(() => {
-        console.log("[CS] Reloading page after 120 minutes interval.");
-        window.location.reload();
-    }, 120 * 60 * 1000); // 120 minutes in milliseconds
-
-
+   
 
     //wait for 5 seconds
     console.log("[CS] Event page detected. Waiting for 5 seconds before proceeding...");

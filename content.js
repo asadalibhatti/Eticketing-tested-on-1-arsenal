@@ -212,8 +212,9 @@ function scheduleNextCheck() {
 
     console.log(`[CS] Next check scheduled at ${nextRun.toLocaleTimeString()} (in ${(delay / 1000).toFixed(2)}s)`);
 
-    setTimeout(runCheck, delay);
+
     chrome.runtime.sendMessage({type: "heartbeat"});
+    setTimeout(runCheck, delay);
 }
 
 async function runCheck() {

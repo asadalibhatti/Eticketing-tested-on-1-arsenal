@@ -4,7 +4,6 @@ let EVENT_URL = "";
 
 let eventTabId = null;
 let notAllowedTabId = null;
-let googleSheetsDataLogged = false; // Track if we've logged Google Sheets data for the first time
 
 console.log('[BG] Background loaded');
 let lastStatus = null;
@@ -22,7 +21,7 @@ function startPolling() {
 // Stop polling Google Sheet
 function stopPolling() {
     if (pollIntervalId) {
-        clearInterval(pollIntervalId);
+        clearTimeout(pollIntervalId);
         pollIntervalId = null;
         console.log('[BG] Polling stopped');
     }
@@ -69,23 +68,6 @@ async function pollSheetAndControl() {
             parseInt(cfg.startSecond, 10) === targetStartSecond
         );
 
-        console.log('[BG] Looking for rows with status=on and startSecond=' + targetStartSecond + ', found ' + matchingRows.length + ' matches');
-        
-        if (matchingRows.length > 0) {
-            console.log('[BG] Matching rows:');
-            matchingRows.forEach((row, index) => {
-                console.log(`[BG] Match ${index + 1}:`, {
-                    status: row.status,
-                    eventUrl: row.eventUrl,
-                    startSecond: row.startSecond,
-                    areSeatsTogether: row.areSeatsTogether,
-                    quantity: row.quantity,
-                    loginEmail: row.loginEmail ? '***@***.***' : 'Not set',
-                    loginPassword: row.loginPassword ? '***' : 'Not set'
-                });
-            });
-        }
-
         const anyMatch = matchingRows.length > 0;
         const currentStatus = anyMatch ? 'on' : 'off';
 
@@ -113,7 +95,7 @@ async function pollSheetAndControl() {
 
 
                     //save to local storage currentStatus
-                    const storageData = {
+                    await chrome.storage.local.set({
                         currentStatus: currentStatus,
                         eventUrl: row.eventUrl,
                         startSecond: row.startSecond,
@@ -127,19 +109,7 @@ async function pollSheetAndControl() {
                         minimumPrice: row.minimumPrice,
                         loginEmail: row.loginEmail,
                         loginPassword: row.loginPassword
-                    };
-                    
-                    console.log('[BG] Saving matched row data to local storage:', {
-                        currentStatus: storageData.currentStatus,
-                        eventUrl: storageData.eventUrl,
-                        startSecond: storageData.startSecond,
-                        areSeatsTogether: storageData.areSeatsTogether,
-                        quantity: storageData.quantity,
-                        loginEmail: storageData.loginEmail ? '***@***.***' : 'Not set',
-                        loginPassword: storageData.loginPassword ? '***' : 'Not set'
                     });
-                    
-                    await chrome.storage.local.set(storageData);
                     EVENT_URL = row.eventUrl;
 
                     function getClubName(url) {
@@ -201,12 +171,39 @@ async function pollSheetAndControl() {
 
 function ensurePolling() {
     if (!pollIntervalId) {
-        pollIntervalId = setInterval(pollSheetAndControl, 10000); // every 10s
+        scheduleNextPoll(); // Start with random delay
         pollSheetAndControl(); // run immediately
-        console.log('[BG] ensurePolling: Polling started');
+        console.log('[BG] ensurePolling: Polling started with random delays');
     } else {
         console.log('[BG] ensurePolling: Polling already running');
     }
+}
+
+function scheduleNextPoll() {
+    // Generate random delay between 20-100 seconds
+    const minDelay = 20000; // 20 seconds
+    const maxDelay = 100000; // 100 seconds
+    const randomDelay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+    
+    // Calculate the exact time when next poll will run
+    const nextPollTime = new Date(Date.now() + randomDelay);
+    const nextPollTimeString = nextPollTime.toLocaleTimeString('en-GB', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+    });
+    
+    console.log(`[BG] Next poll re check sheet scheduled in ${Math.round(randomDelay / 1000)} seconds (at ${nextPollTimeString})`);
+    
+    pollIntervalId = setTimeout(() => {
+        pollSheetAndControl().then(() => {
+            // Schedule next poll after current one completes
+            scheduleNextPoll();
+        }).catch(e => {
+            console.warn('[BG] pollSheetAndControl error, scheduling next poll:', e);
+            scheduleNextPoll();
+        });
+    }, randomDelay);
 }
 
 // Run immediately when background script loads
@@ -241,7 +238,12 @@ function notifyTabStop() {
     if (notAllowedTabId) {
         chrome.tabs.sendMessage(notAllowedTabId, {action: 'stopMonitoring'}, resp => {
             if (chrome.runtime.lastError) {
-                console.warn('[BG] stopMonitoring sendMessage error (tab might not have content script yet):', chrome.runtime.lastError.message);
+                // Check if it's the specific async response error
+                if (chrome.runtime.lastError.message.includes('message channel closed')) {
+                    console.log('[BG] Content script received stop message but channel closed (normal behavior)');
+                } else {
+                    console.warn('[BG] stopMonitoring sendMessage error:', chrome.runtime.lastError.message);
+                }
             } else {
                 console.log('[BG] stop message sent to content script in tab', notAllowedTabId);
             }
@@ -459,8 +461,6 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             if (foundEventTab) {
                 console.log('[BG] Found existing event tab, reloading', foundEventTab.id);
                 eventTabId = foundEventTab.id;
-                // Clear heartbeat tracking for this tab before reloading
-                clearHeartbeatTracking(eventTabId);
                 const tab = await chrome.tabs.get(eventTabId);
 
 // bring the window to front
@@ -487,8 +487,6 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Created event tab', created.id);
                 eventTabId = created.id;
 
-                // Clear any existing heartbeat tracking for new tab
-                clearHeartbeatTracking(eventTabId);
             }
             // //wait for 50 seconds here
             await new Promise(resolve => setTimeout(resolve, 20000));
@@ -506,15 +504,11 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             if (foundNotAllowed) {
                 console.log('[BG] Found existing validation tab, reloading', foundNotAllowed.id);
                 notAllowedTabId = foundNotAllowed.id;
-                // Clear heartbeat tracking for this tab before reloading
-                clearHeartbeatTracking(notAllowedTabId);
                 await chrome.tabs.reload(notAllowedTabId);
             } else {
                 const created2 = await chrome.tabs.create({url: EVENT_NOT_ALLOWED_URL, active: false});
                 console.log('[BG] Created validation tab', created2.id);
                 notAllowedTabId = created2.id;
-                // Clear any existing heartbeat tracking for new tab
-                clearHeartbeatTracking(notAllowedTabId);
             }
         }
 
@@ -549,8 +543,6 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
                 eventTabId = created.id;
 
-                // Clear any existing heartbeat tracking for new tab
-                clearHeartbeatTracking(eventTabId);
             }
             //wait for 5 seconds here
             await new Promise(resolve => setTimeout(resolve, 30000));
@@ -566,8 +558,6 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 console.log('[BG] Validation tab closed, reopening...');
                 const created2 = await chrome.tabs.create({url: EVENT_NOT_ALLOWED_URL, active: false});
                 notAllowedTabId = created2.id;
-                // Clear any existing heartbeat tracking for new tab
-                clearHeartbeatTracking(notAllowedTabId);
 
                 //wait for 5 seconds
                 await new Promise(resolve => setTimeout(resolve, 60000));
@@ -798,30 +788,6 @@ async function fetchSheetConfigAll(sheetUrl) {
         };
     });
 
-    // Log the fetched data for debugging (only first time)
-    if (!googleSheetsDataLogged) {
-        console.log('[BG] Google Sheets data fetched (FIRST TIME):', allRows);
-        console.log('[BG] Number of rows fetched:', allRows.length);
-        
-        // Log each row with key details (only first time)
-        allRows.forEach((row, index) => {
-            console.log(`[BG] Row ${index + 1}:`, {
-                status: row.status,
-                eventUrl: row.eventUrl,
-                startSecond: row.startSecond,
-                areSeatsTogether: row.areSeatsTogether,
-                quantity: row.quantity,
-                loginEmail: row.loginEmail ? '***@***.***' : 'Not set', // Mask email for security
-                loginPassword: row.loginPassword ? '***' : 'Not set', // Mask password for security
-                discordWebhook: row.discordWebhook ? 'Set' : 'Not set',
-                telegramWebhook: row.telegramWebhook ? 'Set' : 'Not set'
-            });
-        });
-        googleSheetsDataLogged = true;
-    } else {
-        console.log('[BG] Google Sheets data fetched (subsequent fetch), rows count:', allRows.length);
-    }
-
     return allRows;
 }
 
@@ -954,74 +920,78 @@ async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
     }
 }
 
-// Store last heartbeat times per tab
-const heartbeatTracker = {};
-const HEARTBEAT_TIMEOUT = 120000; // 2 minutes (180 seconds)
+// Simplified heartbeat tracking - no tab-specific tracking
 const HEARTBEAT_CHECK_INTERVAL = 10000; // check every 10 seconds
-
-function reloadTabs(tabId) {
-    console.warn(`[BG] Reloading tab ${tabId} due to no heartbeat`);
-    chrome.tabs.reload(tabId);
-}
-
-// Helper function to clear heartbeat tracking for specific tabs or all tabs
-function clearHeartbeatTracking(tabIds = null) {
-    if (tabIds === null) {
-        // Clear all heartbeat tracking
-        console.log(`[BG] 🧹 Clearing all heartbeat tracking`);
-        Object.keys(heartbeatTracker).forEach(id => {
-            delete heartbeatTracker[id];
-        });
-    } else {
-        // Clear specific tab IDs
-        const idsArray = Array.isArray(tabIds) ? tabIds : [tabIds];
-        idsArray.forEach(id => {
-            if (heartbeatTracker[id]) {
-                console.log(`[BG] 🧹 Clearing heartbeat tracking for tab ${id}`);
-                delete heartbeatTracker[id];
-            }
-        });
-    }
-}
+const INITIAL_HEARTBEAT_TIMEOUT = 180000; // 3 minutes for initial heartbeat
+const SUBSEQUENT_HEARTBEAT_TIMEOUT = 120000; // 2 minutes for subsequent heartbeats
 
 let lastHeartbeat = null; // store last heartbeat timestamp
+let isFirstHeartbeat = true; // track if this is the first heartbeat received
+let heartbeatMonitoringPaused = false; // track if heartbeat monitoring is paused
 
 // Call this whenever you receive a heartbeat
 function updateHeartbeat() {
-    lastHeartbeat = Date.now();
+    const now = Date.now();
+    lastHeartbeat = now;
+    
+    if (isFirstHeartbeat) {
+        console.log("[BG] 💓 First heartbeat received, switching to 2-minute timeout");
+        isFirstHeartbeat = false;
+    } else {
     console.log("[BG] 💓 Heartbeat received");
+    }
 }
 
 setInterval(async () => {
     const now = Date.now();
-    const timeoutMs = HEARTBEAT_TIMEOUT;
+    
+    // Pause heartbeat monitoring when status is off
+    if (lastStatus === "off") {
+        if (!heartbeatMonitoringPaused) {
+            console.log("[BG] ⏸️ Heartbeat monitoring paused (status is off)");
+            heartbeatMonitoringPaused = true;
+            // Reset heartbeat tracking when pausing
+            lastHeartbeat = null;
+            isFirstHeartbeat = true;
+        }
+        return;
+    }
+    
+    // Resume heartbeat monitoring when status is on
+    if (heartbeatMonitoringPaused && lastStatus === "on") {
+        console.log("[BG] ▶️ Heartbeat monitoring resumed (status is on)");
+        heartbeatMonitoringPaused = false;
+    }
+    
+    // Determine timeout based on whether we've received first heartbeat
+    const timeoutMs = isFirstHeartbeat ? INITIAL_HEARTBEAT_TIMEOUT : SUBSEQUENT_HEARTBEAT_TIMEOUT;
     const timeoutMinutes = timeoutMs / 60000;
+    const timeoutType = isFirstHeartbeat ? "initial" : "subsequent";
 
-    // If no heartbeat ever received, initialize so it times out 1 minute later
+    // If no heartbeat ever received, initialize the countdown
     if (!lastHeartbeat) {
-        lastHeartbeat = now + 60000; // start countdown 1 min ahead
-        console.log("[BG] ⚠️ No heartbeat yet, starting timeout countdown (3 min delay)");
+        lastHeartbeat = now; // Start the countdown from now
+        console.log(`[BG] ⚠️ No heartbeat yet, starting ${timeoutMinutes}-minute ${timeoutType} timeout countdown`);
         return;
     }
 
     const timeSinceLast = now - lastHeartbeat;
 
     if (timeSinceLast > timeoutMs) {
-        console.log(`[BG] ⚠️ Heartbeat timeout, last at ${new Date(lastHeartbeat).toLocaleTimeString()}`);
+        console.log(`[BG] ⚠️ Heartbeat timeout (${timeoutType}), last at ${new Date(lastHeartbeat).toLocaleTimeString()}`);
         console.log(`[BG] Time since last heartbeat: ${Math.round(timeSinceLast / 1000)}s (timeout: ${timeoutMinutes}min)`);
 
-        if (lastStatus === "on") {
             console.log(`[BG] 🔄 No heartbeat for ${timeoutMinutes} minutes, reloading tabs...`);
-            lastHeartbeat = null; // reset so countdown starts fresh
-            clearHeartbeatTracking();
+        
+        // Reset heartbeat tracking and cycle
+        lastHeartbeat = null;
+        isFirstHeartbeat = true;
+        
             await openOrFocusTabs(EVENT_URL, EVENT_NOT_ALLOWED_URL);
-            console.log("[BG] ✅ Tabs reloaded, heartbeat tracking reset");
-        } else {
-            console.log("[BG] Status is off, not reloading tabs");
-        }
+        console.log("[BG] ✅ Tabs reloaded, heartbeat tracking reset to initial 3-minute cycle");
     } else {
         if (timeSinceLast % 30000 < HEARTBEAT_CHECK_INTERVAL) {
-            console.log(`[BG] ✅ Heartbeat OK (${Math.round(timeSinceLast / 1000)}s ago)`);
+            console.log(`[BG] ✅ Heartbeat OK (${Math.round(timeSinceLast / 1000)}s ago, ${timeoutType} timeout: ${timeoutMinutes}min)`);
         }
     }
 }, HEARTBEAT_CHECK_INTERVAL);
