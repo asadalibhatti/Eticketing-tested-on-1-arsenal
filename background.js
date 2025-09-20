@@ -4,6 +4,7 @@ let EVENT_URL = "";
 
 let eventTabId = null;
 let notAllowedTabId = null;
+let googleSheetsDataLogged = false; // Track if we've logged Google Sheets data for the first time
 
 console.log('[BG] Background loaded');
 let lastStatus = null;
@@ -68,6 +69,23 @@ async function pollSheetAndControl() {
             parseInt(cfg.startSecond, 10) === targetStartSecond
         );
 
+        console.log('[BG] Looking for rows with status=on and startSecond=' + targetStartSecond + ', found ' + matchingRows.length + ' matches');
+        
+        if (matchingRows.length > 0) {
+            console.log('[BG] Matching rows:');
+            matchingRows.forEach((row, index) => {
+                console.log(`[BG] Match ${index + 1}:`, {
+                    status: row.status,
+                    eventUrl: row.eventUrl,
+                    startSecond: row.startSecond,
+                    areSeatsTogether: row.areSeatsTogether,
+                    quantity: row.quantity,
+                    loginEmail: row.loginEmail ? '***@***.***' : 'Not set',
+                    loginPassword: row.loginPassword ? '***' : 'Not set'
+                });
+            });
+        }
+
         const anyMatch = matchingRows.length > 0;
         const currentStatus = anyMatch ? 'on' : 'off';
 
@@ -95,7 +113,7 @@ async function pollSheetAndControl() {
 
 
                     //save to local storage currentStatus
-                    await chrome.storage.local.set({
+                    const storageData = {
                         currentStatus: currentStatus,
                         eventUrl: row.eventUrl,
                         startSecond: row.startSecond,
@@ -106,10 +124,22 @@ async function pollSheetAndControl() {
                         telegramChatId: row.telegramChatId,
                         eventId: row.eventId,
                         maximumPrice: row.maximumPrice,
-                        minimumPrice: row.minimumPrice
-
-
+                        minimumPrice: row.minimumPrice,
+                        loginEmail: row.loginEmail,
+                        loginPassword: row.loginPassword
+                    };
+                    
+                    console.log('[BG] Saving matched row data to local storage:', {
+                        currentStatus: storageData.currentStatus,
+                        eventUrl: storageData.eventUrl,
+                        startSecond: storageData.startSecond,
+                        areSeatsTogether: storageData.areSeatsTogether,
+                        quantity: storageData.quantity,
+                        loginEmail: storageData.loginEmail ? '***@***.***' : 'Not set',
+                        loginPassword: storageData.loginPassword ? '***' : 'Not set'
                     });
+                    
+                    await chrome.storage.local.set(storageData);
                     EVENT_URL = row.eventUrl;
 
                     function getClubName(url) {
@@ -378,8 +408,8 @@ async function startFlowFromStorage() {
                 eventUrl: cfg.eventUrl,
                 areSeatsTogether: cfg.areSeatsTogether === 'true', // convert to boolean
                 quantity: parseInt(cfg.quantity, 10) || 1,
-
-
+                loginEmail: cfg.loginEmail,
+                loginPassword: cfg.loginPassword
             });
 
             await openOrFocusTabs(cfg.eventUrl, EVENT_NOT_ALLOWED_URL);
@@ -762,9 +792,35 @@ async function fetchSheetConfigAll(sheetUrl) {
             startSecond: parseInt(map['startsecond'] || '1', 10),
             eventId: map['eventid'] || '',
             maximumPrice: map['maximumprice'] || '',
-            minimumPrice: map['minimumprice'] || ''
+            minimumPrice: map['minimumprice'] || '',
+            loginEmail: map['loginemail'] || '',
+            loginPassword: map['loginpassword'] || ''
         };
     });
+
+    // Log the fetched data for debugging (only first time)
+    if (!googleSheetsDataLogged) {
+        console.log('[BG] Google Sheets data fetched (FIRST TIME):', allRows);
+        console.log('[BG] Number of rows fetched:', allRows.length);
+        
+        // Log each row with key details (only first time)
+        allRows.forEach((row, index) => {
+            console.log(`[BG] Row ${index + 1}:`, {
+                status: row.status,
+                eventUrl: row.eventUrl,
+                startSecond: row.startSecond,
+                areSeatsTogether: row.areSeatsTogether,
+                quantity: row.quantity,
+                loginEmail: row.loginEmail ? '***@***.***' : 'Not set', // Mask email for security
+                loginPassword: row.loginPassword ? '***' : 'Not set', // Mask password for security
+                discordWebhook: row.discordWebhook ? 'Set' : 'Not set',
+                telegramWebhook: row.telegramWebhook ? 'Set' : 'Not set'
+            });
+        });
+        googleSheetsDataLogged = true;
+    } else {
+        console.log('[BG] Google Sheets data fetched (subsequent fetch), rows count:', allRows.length);
+    }
 
     return allRows;
 }

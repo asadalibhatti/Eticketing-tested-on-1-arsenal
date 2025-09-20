@@ -90,18 +90,21 @@ console.log('[LOGIN] Arsenal login content script loaded on', location.href);
         // Wait a bit for autofill to complete
         await new Promise(resolve => setTimeout(resolve, 1500));
         
-        // Use specific credentials
-        // const currentEmail = 'spiderlikmon@gmail.com';
-        // const currentPassword = 'Mooga6137g';
-
-        const currentEmail = 'markjohnsondon7@gmail.com';
-        const currentPassword = 'Mooga613rt';
-
-
-        // const currentEmail = 'Benjaminbusse0@gmail.com';
-        // const currentPassword = 'Footballbusse38@';
-
-        console.log('[LOGIN] Using specific credentials, filling form fields...');
+        // Get login credentials from local storage (from Google Sheets)
+        const { loginEmail, loginPassword } = await chrome.storage.local.get(['loginEmail', 'loginPassword']);
+        
+        if (!loginEmail || !loginPassword) {
+            console.warn('[LOGIN] No login credentials found in local storage, using fallback credentials');
+            // Fallback to hardcoded credentials if not found in Google Sheets
+            const currentEmail = 'markjohnsondon7@gmail.com';
+            const currentPassword = 'Mooga613rt';
+            console.log('[LOGIN] Using fallback credentials, filling form fields...');
+        } else {
+            console.log('[LOGIN] Using credentials from Google Sheets, filling form fields...');
+        }
+        
+        const currentEmail = loginEmail || 'markjohnsondon7@gmail.com';
+        const currentPassword = loginPassword || 'Mooga613rt';
         
         // Clear existing values first
         emailInput.value = '';

@@ -108,10 +108,12 @@ async function startMonitorFlow() {
                 monitor.areSeatsTogether = row.AreSeatsTogether === true || ('' + row.AreSeatsTogether).toLowerCase() === 'true';
                 monitor.quantity = parseInt(row.Quantity || '1', 10);
                 
-                // Save AreSeatsTogether and Quantity to local storage to avoid name mismatch
+                // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
                 await chrome.storage.local.set({
                     areSeatsTogether: monitor.areSeatsTogether,
-                    quantity: monitor.quantity
+                    quantity: monitor.quantity,
+                    loginEmail: row.LoginEmail || '',
+                    loginPassword: row.LoginPassword || ''
                 });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
@@ -514,10 +516,12 @@ async function checkOnce() {
             monitor.areSeatsTogether = matched_row.AreSeatsTogether === true || ('' + matched_row.AreSeatsTogether).toLowerCase() === 'true';
             monitor.quantity = parseInt(matched_row.Quantity || '1', 10);
             
-            // Save AreSeatsTogether and Quantity to local storage to avoid name mismatch
+            // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
             await chrome.storage.local.set({
                 areSeatsTogether: monitor.areSeatsTogether,
-                quantity: monitor.quantity
+                quantity: monitor.quantity,
+                loginEmail: matched_row.LoginEmail || '',
+                loginPassword: matched_row.LoginPassword || ''
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
@@ -597,15 +601,7 @@ async function checkOnce() {
                 console.warn('[CS] 5 consecutive queue-it redirects, refreshing...');
 
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                chrome.runtime.sendMessage({action: 'refreshEventTab'}, (response) => {
-                    if (chrome.runtime.lastError) {
-                        console.error('Message failed:', chrome.runtime.lastError);
-                        return;
-                    }
-                    console.log('Response received after refresh:', response);
-                });
-
-                await delay(50000);
+                await refreshEventTabWithTracking();
                 consecutiveErrorCount = 0; // reset after refresh
                 return;
             }
@@ -625,16 +621,7 @@ async function checkOnce() {
                 console.warn('[CS] 2 consecutive CORS/network errors, refreshing...');
 
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-
-                chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
-                    if (chrome.runtime.lastError) {
-                        console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
-                    } else {
-                        console.log('[CS] refreshEventTab response:', response);
-                    }
-                });
-
-                await delay(80000);
+                await refreshEventTabWithTracking();
                 consecutiveErrorCount = 0; // reset after refresh
                 return;
             }
@@ -655,21 +642,13 @@ async function checkOnce() {
         notfound400erorsCount++;
 
         // If reached 5 errors -> refresh
-        if (notfound400erorsCount === 6) {
-            console.warn('[CS] 6 consecutive errors — refreshing tab.');
-            chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
-                if (chrome.runtime.lastError) {
-                    console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
-                } else {
-                    console.log('[CS] refreshEventTab response:', response);
-                }
-            });
-            //delay 50 seconds
-            await delay(70000);
+        if (notfound400erorsCount === 3) {
+            console.warn('[CS] 3 consecutive errors — refreshing tab.');
+            await refreshEventTabWithTracking();
         }
 
         // If reached 9 errors -> clear cookies + refresh
-        if (notfound400erorsCount >= 11) {
+        if (notfound400erorsCount >= 6) {
             // Clear all cookies
             console.warn('[CS] 11 or more consecutive errors — requesting cookie clear & refresh.');
 
@@ -677,20 +656,9 @@ async function checkOnce() {
             //delay 2 seconds
             await delay(2000);
 
-
             // Refresh again
-            chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
-                if (chrome.runtime.lastError) {
-                    console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
-                } else {
-                    console.log('[CS] refreshEventTab response:', response);
-                }
-            });
-            //wait for 70 seconds before next check
-            await delay(80000);
+            await refreshEventTabWithTracking();
             notfound400erorsCount = 0; // reset error counter
-
-
         }
 
         return;
@@ -1321,4 +1289,47 @@ function playNotifySound(ms = 5000) {
 
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper function to wait for event tab reload completion
+async function waitForEventTabReload(timeoutMs = 120000) {
+    console.log('[CS] Waiting for event tab reload completion...');
+    
+    const startTime = Date.now();
+    const checkInterval = 1000; // Check every 1 second
+    
+    while (Date.now() - startTime < timeoutMs) {
+        const { eventTabReloaded } = await chrome.storage.local.get('eventTabReloaded');
+        
+        if (eventTabReloaded === true) {
+            console.log('[CS] Event tab reload completed successfully');
+            // Reset the flag for next time
+            await chrome.storage.local.set({ eventTabReloaded: false });
+            return true;
+        }
+        
+        // Wait before next check
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+    
+    console.warn('[CS] Event tab reload timeout after', timeoutMs / 1000, 'seconds');
+    return false;
+}
+
+// Helper function to refresh event tab with reload tracking
+async function refreshEventTabWithTracking() {
+    console.log('[CS] Setting event tab reload flag to false');
+    await chrome.storage.local.set({ eventTabReloaded: false });
+    
+    console.log('[CS] Sending refresh event tab message');
+    chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
+        if (chrome.runtime.lastError) {
+            console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
+        } else {
+            console.log('[CS] refreshEventTab response:', response);
+        }
+    });
+    
+    // Wait for reload completion instead of fixed time
+    return await waitForEventTabReload();
 }

@@ -78,6 +78,10 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
             if (token) {
                 localStorage.setItem(TOKEN_KEY, token);
                 console.log("[CS] Token saved to localStorage");
+                
+                // Set event tab reload flag to true to indicate successful reload
+                chrome.storage.local.set({ eventTabReloaded: true });
+                console.log("[CS] Event tab reload flag set to true");
             } else {
                 console.warn("[CS] No verification token found.");
             }
