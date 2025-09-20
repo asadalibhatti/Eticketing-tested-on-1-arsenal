@@ -81,15 +81,26 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
                 return;
             }
 
-            // --- Handle confirm redirect button only after 28s ---
-            if (elapsed >= 90 && confirmRedirectButton && !redirectClicked) {
-                redirectClicked = true;
-                console.log("[QueueIt Script] Confirm redirect button found (after 90s). Clicking...");
+            // --- Handle confirm redirect button as soon as found with specific HTML structure ---
+            if (confirmRedirectButton && !redirectClicked) {
+                // Check for the specific HTML structure - divChallenge with iframe and three-bar-loader-container
+                const divChallenge = document.querySelector('#divChallenge');
+                const challengeContainer = document.querySelector('#challenge-container');
+                const iframe = document.querySelector('#challenge-container iframe');
+                const threeBarLoader = document.querySelector('#three-bar-loader-container');
+                
+                // Only click if the specific structure is present
+                if (divChallenge && challengeContainer && iframe && threeBarLoader) {
+                    redirectClicked = true;
+                    console.log("[QueueIt Script] Confirm redirect button found with correct HTML structure. Clicking immediately...");
 
-                clearInterval(checkElements);
-                await new Promise(resolve => setTimeout(resolve, 130000)); // wait 100s if needed
-                confirmRedirectButton.click();
-                return;
+                    await delay(10000);
+                    clearInterval(checkElements);
+                    confirmRedirectButton.click();
+                    return;
+                } else {
+                    console.log("[QueueIt Script] Confirm redirect button found but HTML structure doesn't match requirements. Waiting...");
+                }
             }
 
             // --- Handle captcha input ---
