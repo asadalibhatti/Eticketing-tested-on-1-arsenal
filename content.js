@@ -277,7 +277,7 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
         // Headers
         const headers = table.cols.map(c => (c.label || '').trim());
-        console.log('[CS] Available column names in Google Sheet:', headers);
+        // console.log('[CS] Available column names in Google Sheet:', headers);
 
         let rowMatchedButOff = false;
         // Iterate rows
@@ -302,7 +302,7 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
             }
             if (status === 'on' && sheetSecond === startSecond) {
-                console.log('[CS] Found matching row data:', rowData);
+                // console.log('[CS] Found matching row data:', rowData);
                 return rowData; // Found matching row
             }
 

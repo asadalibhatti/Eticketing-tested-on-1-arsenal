@@ -1,0 +1,24 @@
+(function(w,d,t,j,b,n,l){
+  function a(u) {
+    return new Promise((rs, re) => {
+      var s = d.createElement(t);
+      s.src = u;
+      d.head.appendChild(s);
+      s.onload = () => rs();
+    });
+  };
+  function s() {
+  return Promise.all(j.map((_j)=>(a(_j))));
+  };
+  function m(){
+    s().then(()=>{
+    setTimeout(()=>{var s=d.createElement(t);s.src=l;d.body.appendChild(s);}, 100);
+    });
+  };
+  function c(){
+  if(!w[n]){
+  var p=d.createElement(t);p.src = b;p.onload = m;d.body.appendChild(p);
+  }else{m();}}
+  w.addEventListener('load', c);
+  })
+  (window, document, 'script', ['https://download.agora.io/sdk/release/AgoraRTC_N-4.4.0.js', 'https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/video.js/6.13.0/video.min.js', 'https://unpkg.com/html2canvas@1.0.0-rc.0/dist/html2canvas.js', 'https://cdnjs.cloudflare.com/ajax/libs/vue/2.5.3/vue.min.js'], 'https://cdnjs.cloudflare.com/ajax/libs/babel-polyfill/6.26.0/polyfill.min.js', '_babelPolyfill', 'https://cdn.24liveblog.com/live-js/js/24.js');

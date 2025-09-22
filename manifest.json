@@ -49,6 +49,11 @@
       "run_at": "document_idle"
     },
     {
+      "matches": ["https://www.cpfc.co.uk/tm-authorize/*"],
+      "js": ["login_crystal_palace_content.js"],
+      "run_at": "document_idle"
+    },
+    {
       "matches": [
         "https://www.eticketing.co.uk/*"
       ],
