@@ -511,6 +511,76 @@ function shouldSendNotificationBasedOnSeats(basketData) {
     return { shouldSend, pairs, pairCount };
 }
 
+// Helper function to get email for notifications
+async function getEmailForNotification() {
+    try {
+        console.log('[CS] Getting email for notification...');
+        
+        // Method 1: Try to get from localStorage
+        const EMAIL_KEY = "user_email";
+        const userEmail = localStorage.getItem(EMAIL_KEY);
+        if (userEmail && userEmail.trim()) {
+            console.log('[CS] Email found in localStorage:', userEmail.substring(0, 5) + '...');
+            return userEmail;
+        }
+        console.log('[CS] Email not found in localStorage');
+        
+        // Method 2: Try to get from chrome.storage.local (loginEmail from Google Sheets)
+        const storageData = await chrome.storage.local.get(['loginEmail']);
+        if (storageData.loginEmail && storageData.loginEmail.trim()) {
+            console.log('[CS] Email found in chrome.storage.local:', storageData.loginEmail.substring(0, 5) + '...');
+            return storageData.loginEmail;
+        }
+        console.log('[CS] Email not found in chrome.storage.local');
+        
+        // Method 3: Try to get from Google Sheet directly if we have sheetUrl and startSecond
+        if (monitor.sheetUrl && monitor.startSecond) {
+            try {
+                console.log('[CS] Attempting to get email from Google Sheet directly...');
+                const matched_row = await getMatchingRowFromSheet(monitor.sheetUrl, monitor.startSecond);
+                if (matched_row && matched_row.LoginEmail && matched_row.LoginEmail.trim()) {
+                    console.log('[CS] Email found in Google Sheet:', matched_row.LoginEmail.substring(0, 5) + '...');
+                    // Also save it to storage for future use
+                    await chrome.storage.local.set({ loginEmail: matched_row.LoginEmail });
+                    return matched_row.LoginEmail;
+                }
+            } catch (e) {
+                console.warn('[CS] Error getting email from Google Sheet:', e.message);
+            }
+        }
+        
+        // Method 4: Try to get from background script (refresh credentials)
+        try {
+            console.log('[CS] Attempting to refresh credentials from background script...');
+            const response = await new Promise((resolve, reject) => {
+                chrome.runtime.sendMessage({ action: 'refreshCredentials' }, (response) => {
+                    if (chrome.runtime.lastError) {
+                        reject(new Error(chrome.runtime.lastError.message));
+                    } else {
+                        resolve(response);
+                    }
+                });
+            });
+            
+            if (response && response.success) {
+                const refreshedData = await chrome.storage.local.get(['loginEmail']);
+                if (refreshedData.loginEmail && refreshedData.loginEmail.trim()) {
+                    console.log('[CS] Email found after refreshing credentials:', refreshedData.loginEmail.substring(0, 5) + '...');
+                    return refreshedData.loginEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[CS] Error refreshing credentials:', e.message);
+        }
+        
+        console.warn('[CS] Could not find email from any source, returning "Unknown Email"');
+        return "Unknown Email";
+    } catch (e) {
+        console.error('[CS] Error getting email for notification:', e);
+        return "Unknown Email";
+    }
+}
+
 async function checkOnce() {
     
 
@@ -848,6 +918,7 @@ async function checkOnce() {
 
     // 2a api Lock seats (POST)
     //               https://www.eticketing.co.uk/arsenal/EDP/BestAvailable/ResaleSeats
+    // https://www.eticketing.co.uk/chelseafc/EDP/Ism/SelectRegularSeat
     const lockUrl = `https://www.eticketing.co.uk/${clubName}/EDP/BestAvailable/${endpointType}Seats`;
     console.log(`[CS] Using ${endpointType} endpoint for locking seats: ${lockUrl}`);
 // Step 2: Prepare body
@@ -889,7 +960,8 @@ async function checkOnce() {
     } catch (e) {
         console.error('[CS] lock fetch failed', e);
         //send message to webhook
-        const errorMessage = `\n\nError locking seats: ${e.message} for received data ${JSON.stringify(data)}`;
+        const email = await getEmailForNotification();
+        const errorMessage = `\n\nError locking seats: ${e.message} for received data ${JSON.stringify(data)}\n👤 **Account:** ${email}`;
         
         
         // Also send to background for error webhook dispatch
@@ -913,7 +985,8 @@ async function checkOnce() {
             console.warn('[CS] direct add to basket failed for all areas, stopping monitoring');
             
             // Send webhook message about the failure
-            const errorMessage = `🎫 Direct add to basket failed for all areas. Event ${monitor.eventId}. Seats were found but could not be added to basket.`;
+            const email = await getEmailForNotification();
+            const errorMessage = `🎫 Direct add to basket failed for all areas. Event ${monitor.eventId}. Seats were found but could not be added to basket.\n👤 **Account:** ${email}`;
             chrome.runtime.sendMessage({
                 action: 'notifyErrorWebhooks',
                 message: errorMessage,
@@ -939,7 +1012,8 @@ async function checkOnce() {
         //send to background for error webhook dispatch
         
         // Send webhook message about the failure
-        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}`;
+        const email = await getEmailForNotification();
+        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}\n👤 **Account:** ${email}`;
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
             message: errorMessage,
@@ -949,7 +1023,8 @@ async function checkOnce() {
         return;
     } else if (lockRes.status !== 200) {
         // Handle any other non-200 status codes
-        const errorMessage = `🎫 Error locking seats: ${lockRes.status} for received data ${JSON.stringify(data)}`;
+        const email = await getEmailForNotification();
+        const errorMessage = `🎫 Error locking seats: ${lockRes.status} for received data ${JSON.stringify(data)}\n👤 **Account:** ${email}`;
         console.warn('[CS] sending error notification:', errorMessage);
         
         chrome.runtime.sendMessage({
