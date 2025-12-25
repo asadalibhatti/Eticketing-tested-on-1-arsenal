@@ -59,6 +59,11 @@
       "run_at": "document_idle"
     },
     {
+      "matches": ["https://login.nottinghamforest.co.uk/*"],
+      "js": ["login_nottingham_forest_content.js"],
+      "run_at": "document_idle"
+    },
+    {
       "matches": [
         "https://www.eticketing.co.uk/*"
       ],

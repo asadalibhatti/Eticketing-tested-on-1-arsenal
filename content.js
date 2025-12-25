@@ -33,6 +33,30 @@ let monitor = {
     intervalId: null,
     last403Time: 0
 };
+
+// Club-based PriceClassId mapping
+const clubPriceClassIdMap = {
+    'arsenal': 1,
+    'nottinghamforest': 317,
+    'cpfc': 1,  // Crystal Palace - default to 1, update if needed
+    'chelseafc': 1,  // Chelsea - default to 1, update if needed
+    // Add more clubs as needed
+};
+
+// Helper function to get PriceClassId for a club
+function getPriceClassIdForClub(clubName) {
+    const normalizedClubName = (clubName || '').toLowerCase().trim();
+    const priceClassId = clubPriceClassIdMap[normalizedClubName];
+    
+    if (priceClassId !== undefined) {
+        console.log(`[CS] Using PriceClassId ${priceClassId} for club: ${clubName}`);
+        return priceClassId;
+    }
+    
+    // Default fallback to 1 if club not found in map
+    console.warn(`[CS] PriceClassId not found for club "${clubName}", using default: 1`);
+    return 1;
+}
 // Auto start monitoring if on the expected page
 (async () => {
     if (!window.location.search.includes("eventId=4&reason=EventArchived")) {
@@ -110,13 +134,19 @@ async function startMonitorFlow() {
                 monitor.quantity = parseInt(row.Quantity || '1', 10);
                 
                 // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
+                // Try multiple variations of the areaIds column name
+                const areaIdsValue = row['areaIds to monitor'] || row['AreaIds to monitor'] || row['areaIds to Monitor'] || 
+                                    row.AreaIds || row.areaIds || row['AreaIds'] || row['areaIds'] || '';
+                
+                console.log('[CS] Reading areaIds from sheet - found value:', areaIdsValue);
+                console.log('[CS] Available row keys:', Object.keys(row));
+                
                 await chrome.storage.local.set({
                     areSeatsTogether: monitor.areSeatsTogether,
                     quantity: monitor.quantity,
                     loginEmail: row.LoginEmail || '',
                     loginPassword: row.LoginPassword || '',
-                    ignoreClubLevel: row.IgnoreClubLevel || row.ignoreClubLevel || '',
-                    ignoreUpperTier: row.IgnoreUpperTier || row.ignoreUpperTier || ''
+                    areaIds: areaIdsValue
                 });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
@@ -277,7 +307,7 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
         // Headers
         const headers = table.cols.map(c => (c.label || '').trim());
-        // console.log('[CS] Available column names in Google Sheet:', headers);
+        console.log('[CS] Available column names in Google Sheet:', headers);
 
         let rowMatchedButOff = false;
         // Iterate rows
@@ -332,10 +362,43 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
     console.log(`[INFO] Using ${endpointType} endpoint for direct add to basket`);
     let successCount = 0;       // Track successful adds
     let totalFetchCount = 0;    // Track total fetch attempts
+    
+    // Get PriceClassId for this club
+    const priceClassId = getPriceClassIdForClub(clubname);
 
-    // Loop over areas in reverse order
-    for (let a = data.length - 1; a >= 0; a--) {
-        const area = data[a];
+    // Get areaIds filter from local storage
+    const { areaIds } = await chrome.storage.local.get(['areaIds']);
+    console.log(`[INFO] Direct add to basket - areaIds filter:`, areaIds);
+    
+    // Parse areaIds if provided (comma-separated string like "15,16,17")
+    let allowedAreaIds = null;
+    if (areaIds && areaIds.trim() !== '') {
+        allowedAreaIds = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        console.log(`[INFO] Direct add to basket - parsed areaIds:`, allowedAreaIds);
+    } else {
+        console.log(`[INFO] Direct add to basket - no areaIds filter, will try all areas`);
+    }
+    
+    // Filter areas based on areaIds setting (if specified)
+    const areasToTry = allowedAreaIds && allowedAreaIds.length > 0
+        ? data.filter(area => allowedAreaIds.includes(area.AreaId))
+        : data;
+    
+    console.log(`[INFO] Direct add to basket - filtering areas: ${data.length} total, ${areasToTry.length} after filter`);
+    if (allowedAreaIds && allowedAreaIds.length > 0) {
+        console.log(`[INFO] Direct add to basket - allowed area IDs:`, allowedAreaIds);
+        console.log(`[INFO] Direct add to basket - filtered area IDs:`, areasToTry.map(a => a.AreaId).join(', '));
+    }
+    
+    // If no areas match the filter, return false
+    if (areasToTry.length === 0) {
+        console.warn(`[INFO] Direct add to basket - no areas match the areaIds filter`);
+        return false;
+    }
+
+    // Loop over filtered areas in reverse order
+    for (let a = areasToTry.length - 1; a >= 0; a--) {
+        const area = areasToTry[a];
 
         for (const priceBand of area.PriceBands) {
             for (const interval of priceBand.AvailableSeatsIntervals) {
@@ -356,7 +419,7 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
                                 AreaId: area.AreaId,
                                 XCoordinate: x,
                                 YCoordinate: interval.YCoord,
-                                PriceClassId: 1,
+                                PriceClassId: priceClassId,
                                 IsSecondaryMarket: endpointType === 'Resale'
                             }
                         ]
@@ -388,7 +451,7 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
                             console.log(`[SUCCESS #${successCount}] AreaId ${area.AreaId}, Row ${interval.YCoord}, Seat ${x} => ${text}`);
 
                             if (successCount >= 3) { // Keep your original 3 success condition
-                                console.log(`[INFO] Reached 10 successes, returning true`);
+                                console.log(`[INFO] Reached 3 successes, returning true`);
                                 return true;
                             }
 
@@ -597,13 +660,19 @@ async function checkOnce() {
             monitor.quantity = parseInt(matched_row.Quantity || '1', 10);
             
             // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
+            // Try multiple variations of the areaIds column name
+            const areaIdsValue = matched_row['areaIds to monitor'] || matched_row['AreaIds to monitor'] || matched_row['areaIds to Monitor'] || 
+                                matched_row.AreaIds || matched_row.areaIds || matched_row['AreaIds'] || matched_row['areaIds'] || '';
+            
+            console.log('[CS] Reading areaIds from sheet in checkOnce - found value:', areaIdsValue);
+            console.log('[CS] Available matched_row keys:', Object.keys(matched_row));
+            
             await chrome.storage.local.set({
                 areSeatsTogether: monitor.areSeatsTogether,
                 quantity: monitor.quantity,
                 loginEmail: matched_row.LoginEmail || '',
                 loginPassword: matched_row.LoginPassword || '',
-                ignoreClubLevel: matched_row.IgnoreClubLevel || matched_row.ignoreClubLevel || '',
-                ignoreUpperTier: matched_row.IgnoreUpperTier || matched_row.ignoreUpperTier || ''
+                areaIds: areaIdsValue
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
@@ -818,79 +887,44 @@ async function checkOnce() {
     console.log('[CS] Total areas found:', data.length);
     console.log('[CS] Area IDs found:', data.map(a => a.AreaId).join(', '));
     
-    // Get ignore settings from local storage
-    const { ignoreClubLevel, ignoreUpperTier } = await chrome.storage.local.get(['ignoreClubLevel', 'ignoreUpperTier']);
-    console.log('[CS] Filter settings - ignoreClubLevel:', ignoreClubLevel, 'ignoreUpperTier:', ignoreUpperTier);
+    // Get areaIds to monitor from local storage
+    const { areaIds } = await chrome.storage.local.get(['areaIds']);
+    console.log('[CS] Filter settings - areaIds to monitor:', areaIds);
     
-    // Filter out club level and upper tier areas (known area IDs for Arsenal Emirates Stadium)
-    // upper tier range 1942-1988
-    // lower tier range 1691-1941
-    // Club level area IDs: 1647-1690
-    const clubLevelAreaIds = [
-        1647, 1648, 1649, 1650, 1651, 1652, 1653, 1654, 1655, 1656, 1657, 1658, 1659, 1660,
-        1661, 1662, 1663, 1664, 1665, 1666, 1667, 1668, 1669, 1670, 1671, 1672, 1673, 1674, 1675, 1676, 1677, 1678, 1679, 1680,
-        1681, 1682, 1683, 1684, 1685, 1686, 1687, 1688, 1689, 1690
-    ];
+    // Parse areaIds if provided (comma-separated string like "15,16,17")
+    let allowedAreaIds = null;
+    if (areaIds && areaIds.trim() !== '') {
+        allowedAreaIds = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        console.log('[CS] Parsed areaIds to monitor:', allowedAreaIds);
+    } else {
+        console.log('[CS] No areaIds specified - will book from any available area');
+    }
     
-    const upperTierAreaIds = [
-        1942, 1943, 1944, 1945, 1946, 1947, 1948, 1949, 1950, 1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960,
-        1961, 1962, 1963, 1964, 1965, 1966, 1967, 1968, 1969, 1970, 1971, 1972, 1973, 1974, 1975, 1976, 1977, 1978, 1979, 1980,
-        1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988
-    ];
-    
-    // Apply conditional filtering based on ignore settings
-    // If ignoreClubLevel is "yes", filter out club level areas
-    // If ignoreUpperTier is "yes", filter out upper tier areas
-    const shouldIgnoreClubLevel = ignoreClubLevel && ignoreClubLevel.toLowerCase() === 'yes';
-    const shouldIgnoreUpperTier = ignoreUpperTier && ignoreUpperTier.toLowerCase() === 'yes';
-    
-    console.log('[CS] Filter logic - shouldIgnoreClubLevel:', shouldIgnoreClubLevel, 'shouldIgnoreUpperTier:', shouldIgnoreUpperTier);
-    
-    // Filter areas based on ignore settings
+    // Filter areas based on areaIds setting
+    // If areaIds is provided, only include areas in that list
+    // If areaIds is empty, include all areas
     const preferredAreas = data.filter(a => {
         if (!a.PriceBands || !a.PriceBands.length) return false;
         
-        // If should ignore club level and this is a club level area, exclude it
-        if (shouldIgnoreClubLevel && clubLevelAreaIds.includes(a.AreaId)) {
-            return false;
+        // If areaIds is specified, only include areas in the allowed list
+        if (allowedAreaIds && allowedAreaIds.length > 0) {
+            return allowedAreaIds.includes(a.AreaId);
         }
         
-        // If should ignore upper tier and this is an upper tier area, exclude it
-        if (shouldIgnoreUpperTier && upperTierAreaIds.includes(a.AreaId)) {
-            return false;
-        }
-        
+        // If no areaIds specified, include all areas
         return true;
     });
     
     console.log('[CS] Preferred areas found after filtering:', preferredAreas.length);
     console.log('[CS] Preferred area IDs:', preferredAreas.map(a => a.AreaId).join(', '));
     
-    // If no preferred areas found, check what areas are available and log the reason
-    if (preferredAreas.length === 0) {
-        const clubLevelAreas = data.filter(a => 
-            a.PriceBands && 
-            a.PriceBands.length && 
-            clubLevelAreaIds.includes(a.AreaId)
-        );
-        
-        const upperTierAreas = data.filter(a => 
-            a.PriceBands && 
-            a.PriceBands.length && 
-            upperTierAreaIds.includes(a.AreaId)
-        );
-        
-        if (clubLevelAreas.length > 0 || upperTierAreas.length > 0) {
-            console.log('[CS] Filtered out areas based on ignore settings:');
-            if (clubLevelAreas.length > 0 && shouldIgnoreClubLevel) {
-                console.log('[CS] Club level areas filtered out (ignoreClubLevel=yes):', clubLevelAreas.map(a => a.AreaId).join(', '));
-            }
-            if (upperTierAreas.length > 0 && shouldIgnoreUpperTier) {
-                console.log('[CS] Upper tier areas filtered out (ignoreUpperTier=yes):', upperTierAreas.map(a => a.AreaId).join(', '));
-            }
-            return;
-        }
-        
+    // If no preferred areas found and areaIds was specified, log the reason
+    if (preferredAreas.length === 0 && allowedAreaIds && allowedAreaIds.length > 0) {
+        const availableAreaIds = data.map(a => a.AreaId);
+        console.log('[CS] No areas found matching the specified areaIds filter');
+        console.log('[CS] Available area IDs:', availableAreaIds.join(', '));
+        console.log('[CS] Requested area IDs:', allowedAreaIds.join(', '));
+        return;
     }
     
     // If no preferred areas found, fall back to any available area
@@ -899,10 +933,7 @@ async function checkOnce() {
     const areaId = area.AreaId;
     const priceBandId = priceBand.PriceBandCode || priceBand.PriceBandId || priceBandId;
     
-    const isClubLevel = clubLevelAreaIds.includes(areaId);
-    const isUpperTier = upperTierAreaIds.includes(areaId);
-    const areaType = isClubLevel ? 'CLUB LEVEL' : isUpperTier ? 'UPPER TIER' : 'LOWER TIER';
-    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId, `(${areaType})`);
+    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId);
 
 
     // Step 1: Get the token from localStorage
@@ -1051,6 +1082,9 @@ async function checkOnce() {
         }
         console.log('[CS] LockedSeats', lockedSeats);
 
+        // Get PriceClassId for this club
+        const priceClassId = getPriceClassIdForClub(clubName);
+
         // Determine how many seats to add to basket
         let seatsToAdd = [];
         
@@ -1058,12 +1092,12 @@ async function checkOnce() {
             // When seats together is true and quantity > 1, add all locked seats
             seatsToAdd = lockedSeats.map(seat => ({
                 Id: seat.Id,
-                PriceClassId: 1
+                PriceClassId: priceClassId
             }));
             console.log('[CS] Adding all locked seats to basket (areSeatsTogether=true, quantity=' + monitor.quantity + ')');
         } else {
             // When seats together is false or quantity is 1, add only the first seat
-            seatsToAdd = [{Id: lockedSeats[0].Id, PriceClassId: 1}];
+            seatsToAdd = [{Id: lockedSeats[0].Id, PriceClassId: priceClassId}];
             console.log('[CS] Adding only first locked seat to basket (areSeatsTogether=' + monitor.areSeatsTogether + ', quantity=' + monitor.quantity + ')');
         }
 
@@ -1103,50 +1137,87 @@ async function checkOnce() {
         }
         console.log('[CS] add to basket status', putRes.status);
        
+        // Check if add to basket failed (not 200 or 201)
+        if (putRes.status !== 200 && putRes.status !== 201) {
+            console.error('[CS] Seat locked but failed to add to basket (status', putRes.status + ')');
+            
+            // Get email for notification
+            const email = await getEmailForNotification();
+            
+            // Format seat details from lockedSeats
+            const seatDetails = lockedSeats.map((seat, idx) => {
+                return `Seat ${idx + 1}: ID ${seat.Id}${seat.AreaId ? `, AreaId ${seat.AreaId}` : ''}${seat.Row ? `, Row ${seat.Row}` : ''}${seat.SeatNumber ? `, Seat ${seat.SeatNumber}` : ''}`;
+            }).join('\n');
+            
+            // Create error message with seat details
+            const errorMessage = `❌ **SEAT LOCKED BUT NOT ADDED TO BASKET**
+════════════════════════════════════════════════════════════════
+🎫 **Status:** Seat locked successfully but failed to add to basket (HTTP ${putRes.status})
+🆔 **Event ID:** ${monitor.eventId}
+🔗 **Event URL:** ${monitor.eventUrl}
+📍 **Area ID:** ${areaId}
+👤 **Account:** ${email}
+            
+🎫 **LOCKED SEATS:**
+${seatDetails}
+            
+⚠️ **Action Required:** Please check the basket manually or try again.
+════════════════════════════════════════════════════════════════`;
+            
+            console.error('[CS] Sending error notification for locked seat not added to basket');
+            chrome.runtime.sendMessage({
+                action: 'notifyErrorWebhooks',
+                message: errorMessage,
+                payload: null
+            });
+            
+            // Return early to prevent success notification
+            return;
+        }
+        
+        // Ticket successfully added to basket (status 200 or 201)
+        console.log('[CS] Ticket successfully added to basket, waiting 2 seconds before fetching data layer...');
+        
+        // Wait 2 seconds before calling GetDataLayer to ensure data is ready
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Get data layer (products added to basket)
+        const dlUrl = `https://www.eticketing.co.uk/${clubName}/tagManager/GetDataLayer`;
+        console.log('[CS] Fetching data layer after 2 second delay:', dlUrl);
+        let dlRes;
+        try {
+            dlRes = await fetch(dlUrl, {
+                method: 'GET',
+                headers: {
+                    "authority": "www.eticketing.co.uk",
+                    "path": `/${clubName}/tagManager/GetDataLayer`,
+                    "scheme": "https",
+                    "accept-encoding": "gzip, deflate, br, zstd",
+                    "accept": "application/json, " +
+                        "text/plain, */*",
+                    "accept-language": "en-US,en;q=0.9,ur;q=0.8",
+                    "dnt": "1",
+                    "priority": "u=1, i",
+                    "origin": "https://www.eticketing.co.uk",
+                    "x-requested-with": "XMLHttpRequest",
+                    "referer": monitor.eventUrl
+                },
+                credentials: "include"
+            });
+        } catch (e) {
+            console.warn('[CS] getDataLayer fetch failed', e);
+        }
+        let dlJson = null;
+        try {
+            if (dlRes) dlJson = await dlRes.json();
+        } catch (e) {
+            console.warn('[CS] data layer parse failed', e);
+        }
 
+        console.log('[CS] dataLayer result', dlJson);
 
-    }
-
-// Basket HTML will be fetched only if needed after dataLayer processing
-
-// Get data layer (products added to basket)
-    const dlUrl = `https://www.eticketing.co.uk/arsenal/tagManager/GetDataLayer`;
-    console.log('[CS] fetching data layer', dlUrl);
-    let dlRes;
-    try {
-
-        dlRes = await fetch(dlUrl, {
-            method: 'GET',
-            headers: {
-                "authority": "www.eticketing.co.uk",
-                "path": "/arsenal/tagManager/GetDataLayer",
-                "scheme": "https",
-                "accept-encoding": "gzip, deflate, br, zstd",
-                "accept": "application/json, " +
-                    "text/plain, */*",
-                "accept-language": "en-US,en;q=0.9,ur;q=0.8",
-                "dnt": "1",
-                "priority": "u=1, i",
-                "origin": "https://www.eticketing.co.uk",
-                "x-requested-with": "XMLHttpRequest",
-                "referer": monitor.eventUrl
-            },
-            credentials: "include"
-        });
-    } catch (e) {
-        console.warn('[CS] getDataLayer fetch failed', e);
-    }
-    let dlJson = null;
-    try {
-        if (dlRes) dlJson = await dlRes.json();
-    } catch (e) {
-        console.warn('[CS] data layer parse failed', e);
-    }
-
-    console.log('[CS] dataLayer result', dlJson);
-
-    //asyn call checkOnce function
-    checkOnce().catch(e => console.error('[CS] checkOnce error after one product was added to basket', e));
+        //asyn call checkOnce function
+        checkOnce().catch(e => console.error('[CS] checkOnce error after one product was added to basket', e));
 
 
 
@@ -1167,19 +1238,51 @@ async function checkOnce() {
     let crn = "Unknown";
     
     if (dlJson && Array.isArray(dlJson)) {
-        // Find the last basket_viewed event which contains current basket items
-        const basketViewedEvents = dlJson.filter(item => item.event === 'basket_viewed');
-        if (basketViewedEvents.length > 0) {
-            basketData = basketViewedEvents[basketViewedEvents.length - 1]; // Get the last one
+        // First, try to find product_added_to_basket events (these contain price information)
+        const productAddedEvents = dlJson.filter(item => item.event === 'product_added_to_basket');
+        if (productAddedEvents.length > 0) {
+            // Get the last product_added_to_basket event
+            basketData = productAddedEvents[productAddedEvents.length - 1];
             products = basketData.products || [];
-            totalValue = basketData.value || 0;
-            currency = basketData.currency || "GBP";
+            
+            // Calculate total value from products (sum of all prices)
+            totalValue = products.reduce((sum, product) => {
+                const price = parseFloat(product.price || 0);
+                return sum + (price * (product.quantity || 1));
+            }, 0);
+            
+            currency = products[0]?.currency || basketData.currency || "GBP";
             membershipType = basketData.membership_type || "Unknown";
             crn = basketData.crn || "Unknown";
             
             if (products.length > 0) {
                 eventName = products[0].name || "Unknown Event";
                 eventDate = products[0].kickoff_datetime || "Unknown Date/Time";
+            }
+            
+            console.log('[CS] Found product_added_to_basket event with', products.length, 'products');
+            console.log('[CS] Products with prices:', products.map(p => ({ 
+                seat: `${p.seatBlock} Row ${p.seatRow} Seat ${p.seatSeat}`, 
+                price: p.price, 
+                currency: p.currency 
+            })));
+        } else {
+            // Fall back to basket_viewed event if product_added_to_basket is not found
+            const basketViewedEvents = dlJson.filter(item => item.event === 'basket_viewed');
+            if (basketViewedEvents.length > 0) {
+                basketData = basketViewedEvents[basketViewedEvents.length - 1]; // Get the last one
+                products = basketData.products || [];
+                totalValue = basketData.value || 0;
+                currency = basketData.currency || "GBP";
+                membershipType = basketData.membership_type || "Unknown";
+                crn = basketData.crn || "Unknown";
+                
+                if (products.length > 0) {
+                    eventName = products[0].name || "Unknown Event";
+                    eventDate = products[0].kickoff_datetime || "Unknown Date/Time";
+                }
+                
+                console.log('[CS] Found basket_viewed event with', products.length, 'products');
             }
         }
     }
@@ -1188,7 +1291,16 @@ async function checkOnce() {
     // This happens when:
     // 1. Products array is empty, OR
     // 2. Products array length doesn't match the quantity (incomplete data)
-    const expectedQuantity = basketData ? basketData.quantity || 0 : 0;
+    let expectedQuantity = 0;
+    if (basketData) {
+        // For product_added_to_basket events, calculate quantity from products
+        if (basketData.event === 'product_added_to_basket' && products.length > 0) {
+            expectedQuantity = products.reduce((sum, product) => sum + (product.quantity || 1), 0);
+        } else {
+            // For basket_viewed events, use the quantity from the event
+            expectedQuantity = basketData.quantity || 0;
+        }
+    }
     const needsFallback = products.length === 0 || (expectedQuantity > 0 && products.length < expectedQuantity);
     
     // Only fetch basket HTML if dataLayer is incomplete
@@ -1389,6 +1501,7 @@ ${seatInfo}${pairInfoText}
 
 // stop monitoring after successful booking to avoid multiple BOOKINGS
 // stopMonitoring('successfully added to basket');
+    } // End of else block (successful add to basket)
 }
 
 function stopMonitoring(reason) {//stop of monitoring will be received from content script signal
