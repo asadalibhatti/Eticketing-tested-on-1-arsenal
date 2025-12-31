@@ -39,7 +39,7 @@ const clubPriceClassIdMap = {
     'arsenal': 1,
     'nottinghamforest': 317,
     'cpfc': 1,  // Crystal Palace - default to 1, update if needed
-    'chelseafc': 1,  // Chelsea - default to 1, update if needed
+    'chelseafc': 2,  // Chelsea - default to 1, update if needed
     // Add more clubs as needed
 };
 
@@ -138,15 +138,18 @@ async function startMonitorFlow() {
                 const areaIdsValue = row['areaIds to monitor'] || row['AreaIds to monitor'] || row['areaIds to Monitor'] || 
                                     row.AreaIds || row.areaIds || row['AreaIds'] || row['areaIds'] || '';
                 
-                console.log('[CS] Reading areaIds from sheet - found value:', areaIdsValue);
-                console.log('[CS] Available row keys:', Object.keys(row));
+                // Try multiple variations of the areas to ignore column name
+                const areasToIgnoreValue = row['areas to ignore'] || row['Areas to ignore'] || row['Areas to Ignore'] || 
+                                          row.AreasToIgnore || row.areasToIgnore || row['AreasToIgnore'] || row['areasToIgnore'] || '';
+                
                 
                 await chrome.storage.local.set({
                     areSeatsTogether: monitor.areSeatsTogether,
                     quantity: monitor.quantity,
                     loginEmail: row.LoginEmail || '',
                     loginPassword: row.LoginPassword || '',
-                    areaIds: areaIdsValue
+                    areaIds: areaIdsValue,
+                    areasToIgnore: areasToIgnoreValue
                 });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
@@ -307,7 +310,6 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 
         // Headers
         const headers = table.cols.map(c => (c.label || '').trim());
-        console.log('[CS] Available column names in Google Sheet:', headers);
 
         let rowMatchedButOff = false;
         // Iterate rows
@@ -366,9 +368,10 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
     // Get PriceClassId for this club
     const priceClassId = getPriceClassIdForClub(clubname);
 
-    // Get areaIds filter from local storage
-    const { areaIds } = await chrome.storage.local.get(['areaIds']);
+    // Get areaIds and areasToIgnore filters from local storage
+    const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
     console.log(`[INFO] Direct add to basket - areaIds filter:`, areaIds);
+    console.log(`[INFO] Direct add to basket - areasToIgnore filter:`, areasToIgnore);
     
     // Parse areaIds if provided (comma-separated string like "15,16,17")
     let allowedAreaIds = null;
@@ -379,16 +382,36 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
         console.log(`[INFO] Direct add to basket - no areaIds filter, will try all areas`);
     }
     
-    // Filter areas based on areaIds setting (if specified)
-    const areasToTry = allowedAreaIds && allowedAreaIds.length > 0
-        ? data.filter(area => allowedAreaIds.includes(area.AreaId))
-        : data;
+    // Parse areasToIgnore if provided
+    let ignoredAreaIds = null;
+    if (areasToIgnore && areasToIgnore.trim() !== '') {
+        ignoredAreaIds = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        console.log(`[INFO] Direct add to basket - parsed areasToIgnore:`, ignoredAreaIds);
+    }
+    
+    // Filter areas based on areaIds and areasToIgnore settings
+    const areasToTry = data.filter(area => {
+        // If allowedAreaIds is specified, only include areas in the allowed list
+        if (allowedAreaIds && allowedAreaIds.length > 0) {
+            if (!allowedAreaIds.includes(area.AreaId)) return false;
+        }
+        
+        // If ignoredAreaIds is specified, exclude areas in the ignore list
+        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
+            if (ignoredAreaIds.includes(area.AreaId)) return false;
+        }
+        
+        return true;
+    });
     
     console.log(`[INFO] Direct add to basket - filtering areas: ${data.length} total, ${areasToTry.length} after filter`);
     if (allowedAreaIds && allowedAreaIds.length > 0) {
         console.log(`[INFO] Direct add to basket - allowed area IDs:`, allowedAreaIds);
-        console.log(`[INFO] Direct add to basket - filtered area IDs:`, areasToTry.map(a => a.AreaId).join(', '));
     }
+    if (ignoredAreaIds && ignoredAreaIds.length > 0) {
+        console.log(`[INFO] Direct add to basket - ignored area IDs:`, ignoredAreaIds);
+    }
+    console.log(`[INFO] Direct add to basket - filtered area IDs:`, areasToTry.map(a => a.AreaId).join(', '));
     
     // If no areas match the filter, return false
     if (areasToTry.length === 0) {
@@ -664,15 +687,18 @@ async function checkOnce() {
             const areaIdsValue = matched_row['areaIds to monitor'] || matched_row['AreaIds to monitor'] || matched_row['areaIds to Monitor'] || 
                                 matched_row.AreaIds || matched_row.areaIds || matched_row['AreaIds'] || matched_row['areaIds'] || '';
             
-            console.log('[CS] Reading areaIds from sheet in checkOnce - found value:', areaIdsValue);
-            console.log('[CS] Available matched_row keys:', Object.keys(matched_row));
+            // Try multiple variations of the areas to ignore column name
+            const areasToIgnoreValue = matched_row['areas to ignore'] || matched_row['Areas to ignore'] || matched_row['Areas to Ignore'] || 
+                                      matched_row.AreasToIgnore || matched_row.areasToIgnore || matched_row['AreasToIgnore'] || matched_row['areasToIgnore'] || '';
+            
             
             await chrome.storage.local.set({
                 areSeatsTogether: monitor.areSeatsTogether,
                 quantity: monitor.quantity,
                 loginEmail: matched_row.LoginEmail || '',
                 loginPassword: matched_row.LoginPassword || '',
-                areaIds: areaIdsValue
+                areaIds: areaIdsValue,
+                areasToIgnore: areasToIgnoreValue
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
@@ -866,6 +892,7 @@ async function checkOnce() {
     let data;
     try {
         data = await res.json();
+        console.log('[CS] seats response data', data);
     } catch (e) {
         console.warn('[CS] seats response JSON parse failed', e);
         console.log('[CS] seats response text', await res.text());
@@ -883,57 +910,89 @@ async function checkOnce() {
     }
 
 
-    console.log('[CS] tickets available seats found:', data);
-    console.log('[CS] Total areas found:', data.length);
-    console.log('[CS] Area IDs found:', data.map(a => a.AreaId).join(', '));
+    const areaIdsList = data.map(a => a.AreaId).join(', ');
+    console.log(`[CS] Found ${data.length} area(s): ${areaIdsList}`);
     
     // Get areaIds to monitor from local storage
-    const { areaIds } = await chrome.storage.local.get(['areaIds']);
-    console.log('[CS] Filter settings - areaIds to monitor:', areaIds);
+    const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
     
     // Parse areaIds if provided (comma-separated string like "15,16,17")
     let allowedAreaIds = null;
     if (areaIds && areaIds.trim() !== '') {
         allowedAreaIds = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
-        console.log('[CS] Parsed areaIds to monitor:', allowedAreaIds);
-    } else {
-        console.log('[CS] No areaIds specified - will book from any available area');
     }
     
-    // Filter areas based on areaIds setting
+    // Parse areasToIgnore if provided
+    let ignoredAreaIds = null;
+    if (areasToIgnore && areasToIgnore.trim() !== '') {
+        ignoredAreaIds = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+    }
+    
+    if (allowedAreaIds && allowedAreaIds.length > 0) {
+        console.log(`[CS] Monitoring ${allowedAreaIds.length} area(s): ${allowedAreaIds.join(', ')}`);
+    }
+    if (ignoredAreaIds && ignoredAreaIds.length > 0) {
+        console.log(`[CS] Ignoring ${ignoredAreaIds.length} area(s)`);
+    }
+    
+    // Filter areas based on areaIds and areasToIgnore settings
     // If areaIds is provided, only include areas in that list
-    // If areaIds is empty, include all areas
+    // If areasToIgnore is provided, exclude areas in that list
+    // If both are empty, include all areas
     const preferredAreas = data.filter(a => {
         if (!a.PriceBands || !a.PriceBands.length) return false;
         
         // If areaIds is specified, only include areas in the allowed list
         if (allowedAreaIds && allowedAreaIds.length > 0) {
-            return allowedAreaIds.includes(a.AreaId);
+            if (!allowedAreaIds.includes(a.AreaId)) return false;
         }
         
-        // If no areaIds specified, include all areas
+        // If areasToIgnore is specified, exclude areas in the ignore list
+        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
+            if (ignoredAreaIds.includes(a.AreaId)) return false;
+        }
+        
         return true;
     });
     
-    console.log('[CS] Preferred areas found after filtering:', preferredAreas.length);
-    console.log('[CS] Preferred area IDs:', preferredAreas.map(a => a.AreaId).join(', '));
+    // If no preferred areas found, check if filters were applied
+    if (preferredAreas.length === 0) {
+        // If areaIds filter was specified but no matches found, return early
+        if (allowedAreaIds && allowedAreaIds.length > 0) {
+            console.log(`[CS] No matching areas found (monitoring: ${allowedAreaIds.join(', ')}, available: ${areaIdsList})`);
+            return;
+        }
+        
+        // If areasToIgnore filter was specified but all areas were filtered out, return early
+        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
+            console.log(`[CS] All areas ignored (${areaIdsList} in ignore list) - skipping`);
+            return;
+        }
+        
+        // If no filters were specified (both empty), fall back to any available area
+        console.log('[CS] No preferred areas found, using any available area');
+    } else {
+        const preferredIds = preferredAreas.map(a => a.AreaId).join(', ');
+        console.log(`[CS] ${preferredAreas.length} area(s) after filtering: ${preferredIds}`);
+    }
     
-    // If no preferred areas found and areaIds was specified, log the reason
-    if (preferredAreas.length === 0 && allowedAreaIds && allowedAreaIds.length > 0) {
-        const availableAreaIds = data.map(a => a.AreaId);
-        console.log('[CS] No areas found matching the specified areaIds filter');
-        console.log('[CS] Available area IDs:', availableAreaIds.join(', '));
-        console.log('[CS] Requested area IDs:', allowedAreaIds.join(', '));
+    // Select area from preferredAreas if available
+    // Only fall back to original data if no filters were specified (both areaIds and areasToIgnore are empty)
+    const area = preferredAreas.length > 0 
+        ? preferredAreas[preferredAreas.length - 1] 
+        : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
+    
+    // Double-check: if area is in ignore list and ignore list is specified, this should not happen
+    if (ignoredAreaIds && ignoredAreaIds.length > 0 && area && ignoredAreaIds.includes(area.AreaId)) {
+        console.error('[CS] ERROR: Selected area is in ignore list! AreaId:', area.AreaId);
         return;
     }
     
-    // If no preferred areas found, fall back to any available area
-    const area = preferredAreas.length > 0 ? preferredAreas[preferredAreas.length - 1] : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
     const priceBand = area.PriceBands[0];
     const areaId = area.AreaId;
-    const priceBandId = priceBand.PriceBandCode || priceBand.PriceBandId || priceBandId;
+    const priceBandId = priceBand.PriceBandCode ;
     
-    console.log('[CS] selected areaId', areaId, 'priceBandId', priceBandId);
+    console.log(`[CS] Selected area ${areaId}, price band ${priceBandId}`);
 
 
     // Step 1: Get the token from localStorage
@@ -1008,7 +1067,7 @@ async function checkOnce() {
     console.log('[CS] lock response status', lockRes.status);
     
     // Handle different lock response statuses
-    if (lockRes.status === 403) {
+    if (lockRes.status === 403 ) {
         console.warn('[CS] lock got 403 Forbidden, trying to add directly to basket with 2nd api');
 
         // try direct add to basket with 2nd api
