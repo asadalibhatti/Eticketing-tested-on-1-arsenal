@@ -64,6 +64,11 @@
       "run_at": "document_idle"
     },
     {
+      "matches": ["https://auth.tottenhamhotspur.com/u/login*"],
+      "js": ["login_tottenham_content.js"],
+      "run_at": "document_idle"
+    },
+    {
       "matches": [
         "https://www.eticketing.co.uk/*"
       ],

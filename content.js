@@ -40,6 +40,7 @@ const clubPriceClassIdMap = {
     'nottinghamforest': 317,
     'cpfc': 1,  // Crystal Palace - default to 1, update if needed
     'chelseafc': 2,  // Chelsea - default to 1, update if needed
+    'tottenhamhotspur': 1,
     // Add more clubs as needed
 };
 

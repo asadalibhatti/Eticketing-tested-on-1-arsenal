@@ -325,10 +325,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             console.log('[BG] Webhook config:', {discordWebhook: !!discordWebhook, telegramWebhook: !!telegramWebhook});
 
-            if (!discordWebhook && !telegramWebhook) {
-                console.warn('[BG] No webhooks configured, skipping notification');
-                return;
-            }
+            // Always send success notification: default Discord webhook + sheet webhook if provided
             console.log('[BG] Sending webhooks...');
             sendWebhooks(discordWebhook, telegramWebhook, message, payload);
         }).catch(err => {
@@ -712,6 +709,12 @@ async function closeOtherEticketingTabs() {
     // console.log('[BG] closeOtherEticketingTabs, allowed:', allowedUrls);
     const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
     for (const t of tabs) {
+        // Skip closing tabs that have "checkout" in the URL
+        if (t.url && t.url.toLowerCase().includes('checkout')) {
+            console.log('[BG] Skipping checkout tab:', t.id, t.url);
+            continue;
+        }
+        
         if (!allowedUrls.some(u => t.url && t.url.startsWith(u))) {
             try {
                 await chrome.tabs.remove(t.id);
@@ -727,6 +730,12 @@ async function closeOtherEticketingTabs() {
     // Close all tabs whose URL starts with https://ticketmastersportuk.queue-it.net/
     chrome.tabs.query({}, (tabs) => {
         tabs.forEach(tab => {
+            // Skip closing tabs that have "checkout" in the URL
+            if (tab.url && tab.url.toLowerCase().includes('checkout')) {
+                console.log('[BG] Skipping checkout tab:', tab.id, tab.url);
+                return;
+            }
+            
             if (tab.url && tab.url.startsWith('https://ticketmastersportuk.queue-it.net/')) {
                 chrome.tabs.remove(tab.id, () => {
                     if (chrome.runtime.lastError) {
@@ -926,36 +935,46 @@ async function sendErrorWebhook(errorWebhook, message, payload) {
     }
 }
 
+// Default Discord webhook for success notifications (always sent for all clubs)
+const DEFAULT_SUCCESS_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br';
+
 async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
     console.log('[BG] sendWebhooks called', {
         discordWebhook: !!discordWebhook,
         telegramWebhook: !!telegramWebhook,
         messageLength: message.length
     });
-    try {
-        if (discordWebhook) {
-            console.log('[BG] Sending to Discord webhook:', discordWebhook);
-            const response = await fetch(discordWebhook, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({content: message, embeds: []})
-            });
-            console.log('[BG] Discord webhook response status:', response.status);
-            console.log('[BG] discord webhook sent based on google sheet set webhook url: ', discordWebhook);
+    const discordBody = JSON.stringify({content: message, embeds: []});
 
-            // if discordWebhook is different from : https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br
-            //than send notification on this webhook as well
-            if (discordWebhook !== 'https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br') {
-                await fetch("https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br", {
+    // 1) Always send success notification to default Discord webhook for all clubs
+    try {
+        console.log('[BG] Sending to default success Discord webhook');
+        await fetch(DEFAULT_SUCCESS_DISCORD_WEBHOOK, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: discordBody
+        });
+        console.log('[BG] Default success Discord webhook sent');
+    } catch (e) {
+        console.warn('[BG] default discord webhook send failed', e);
+    }
+
+    // 2) If Google sheet provides another Discord webhook, also send there (no duplicate if same URL)
+    try {
+        if (discordWebhook && discordWebhook.trim()) {
+            const sheetWebhook = discordWebhook.trim();
+            if (sheetWebhook !== DEFAULT_SUCCESS_DISCORD_WEBHOOK) {
+                console.log('[BG] Sending to sheet Discord webhook:', sheetWebhook);
+                await fetch(sheetWebhook, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({content: message, embeds: []})
+                    body: discordBody
                 });
-                console.log('[BG] discord webhook sent to my developer webhook as well');
+                console.log('[BG] Sheet Discord webhook sent');
             }
         }
     } catch (e) {
-        console.warn('[BG] discord send failed', e);
+        console.warn('[BG] sheet discord send failed', e);
     }
     try {
         if (telegramWebhook) {
