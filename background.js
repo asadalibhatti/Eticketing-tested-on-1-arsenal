@@ -10,21 +10,54 @@ let lastStatus = null;
 let pollIntervalId = null;
 let sheetUrl = "https://docs.google.com/spreadsheets/d/1uiHk8KEp-Yc5tj8l6RnY2dEGZwsG2aMPhqiO5IP5mq0/edit?usp=sharing";
 
-// Start polling Google Sheet
+// Queue waiting: flag is set only by content script messages. Cleared if no setQueueWaiting message in last 7s.
+let lastSetQueueWaitingAt = 0;
+const QUEUE_WAITING_TIMEOUT_MS = 7000;
+const QUEUE_WAITING_CHECK_INTERVAL_MS = 3000;
+
+// On extension/background start, clear the flag so we never start with a stale true from a previous session
+lastSetQueueWaitingAt = 0;
+chrome.storage.local.set({ inQueueWaiting: false });
+console.log('[BG] Queue waiting flag cleared on start');
+
+async function checkQueueWaitingTimeout() {
+    if (!lastSetQueueWaitingAt) return;
+    if (Date.now() - lastSetQueueWaitingAt <= QUEUE_WAITING_TIMEOUT_MS) return;
+    lastSetQueueWaitingAt = 0;
+    await chrome.storage.local.set({ inQueueWaiting: false });
+    console.log('[BG] No setQueueWaiting message in 7s - cleared inQueueWaiting');
+}
+
+setInterval(() => { checkQueueWaitingTimeout(); }, QUEUE_WAITING_CHECK_INTERVAL_MS);
+
+// Alarms keep the service worker from going idle and drive sheet polling
+const POLL_SHEET_ALARM = 'pollSheet';
+const KEEP_ALIVE_ALARM = 'keepAlive';
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === POLL_SHEET_ALARM) {
+        pollSheetAndControl()
+            .then(() => scheduleNextPoll())
+            .catch(e => {
+                console.warn('[BG] pollSheetAndControl error, scheduling next poll:', e);
+                scheduleNextPoll();
+            });
+    } else if (alarm.name === KEEP_ALIVE_ALARM) {
+        checkQueueWaitingTimeout();
+    }
+});
+
+// Start polling Google Sheet (uses alarms so background stays active)
 function startPolling() {
-    if (pollIntervalId) return; // already running
-    console.log('[BG] Polling started');
-    // pollIntervalId = setInterval(pollSheetAndControl, 10000);
-    // pollSheetAndControl(); // run immediately
+    ensurePolling();
 }
 
 // Stop polling Google Sheet
 function stopPolling() {
-    if (pollIntervalId) {
-        clearTimeout(pollIntervalId);
-        pollIntervalId = null;
-        console.log('[BG] Polling stopped');
-    }
+    chrome.alarms.clear(POLL_SHEET_ALARM);
+    chrome.alarms.clear(KEEP_ALIVE_ALARM);
+    pollIntervalId = null;
+    console.log('[BG] Polling stopped');
 }
 
 tabsOpenRecheckCount = 0;
@@ -169,43 +202,37 @@ async function pollSheetAndControl() {
     }
 }
 
-// --- Auto Start Polling ---
+// --- Auto Start Polling (alarm-based so background stays active) ---
 
 function ensurePolling() {
     if (!pollIntervalId) {
-        scheduleNextPoll(); // Start with random delay
+        pollIntervalId = true; // mark polling active
+        // Keep-alive alarm: fire every 1 minute so service worker doesn't go idle
+        chrome.alarms.create(KEEP_ALIVE_ALARM, { periodInMinutes: 1 });
+        scheduleNextPoll();
         pollSheetAndControl(); // run immediately
-        console.log('[BG] ensurePolling: Polling started with random delays');
+        console.log('[BG] ensurePolling: Polling started with alarms (sheet + keepAlive)');
     } else {
         console.log('[BG] ensurePolling: Polling already running');
     }
 }
 
 function scheduleNextPoll() {
-    // Generate random delay between 20-100 seconds
-    const minDelay = 20000; // 20 seconds
+    // Random delay between 20-100 seconds (same as before)
+    const minDelay = 20000;   // 20 seconds
     const maxDelay = 100000; // 100 seconds
     const randomDelay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
-    
-    // Calculate the exact time when next poll will run
+
     const nextPollTime = new Date(Date.now() + randomDelay);
     const nextPollTimeString = nextPollTime.toLocaleTimeString('en-GB', {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit'
     });
-    
+
     console.log(`[BG] Next poll re check sheet scheduled in ${Math.round(randomDelay / 1000)} seconds (at ${nextPollTimeString})`);
-    
-    pollIntervalId = setTimeout(() => {
-        pollSheetAndControl().then(() => {
-            // Schedule next poll after current one completes
-            scheduleNextPoll();
-        }).catch(e => {
-            console.warn('[BG] pollSheetAndControl error, scheduling next poll:', e);
-            scheduleNextPoll();
-        });
-    }, randomDelay);
+
+    chrome.alarms.create(POLL_SHEET_ALARM, { when: Date.now() + randomDelay });
 }
 
 // Run immediately when background script loads
@@ -256,9 +283,14 @@ function notifyTabStop() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "clearCookiesAndRefresh") {
-        console.log('[BG] clearCookiesAndRefresh requested from popup', msg);
+        // Only clear when content script (queue-it or eticketing page) sends the message, not popup
+        if (!sender.tab) {
+            console.log('[BG] clearCookiesAndRefresh ignored - request from popup, only content script can trigger clear');
+            sendResponse({ success: false, message: 'Only content script can request clear cookies' });
+            return false;
+        }
+        console.log('[BG] clearCookiesAndRefresh requested from content script', sender.tab.url);
         chrome.cookies.getAll({}, function (cookies) {
-            //clear all cookies
             cookies.forEach(cookie => {
                 chrome.cookies.remove({
                     url: `https://${cookie.domain}${cookie.path}`,
@@ -267,14 +299,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     console.log(`[BG] Cookie cleared: ${cookie.name}`);
                 });
             });
-            // Send response after clearing cookies
-            sendResponse({success: true, message: 'Cookies cleared successfully'});
+            sendResponse({ success: true, message: 'Cookies cleared successfully' });
         });
-
-        // if (sender.tab?.id) {
-        //     chrome.tabs.reload(sender.tab.id);
-        // }
         return true; // keep channel open for async response
+    }
+    if (msg.action === 'setQueueWaiting') {
+        const waiting = msg.inQueueWaiting === true;
+        chrome.storage.local.set({ inQueueWaiting: waiting });
+        if (waiting) {
+            lastSetQueueWaitingAt = Date.now();
+            console.log('[BG] setQueueWaiting true (people ahead of you)');
+        } else {
+            lastSetQueueWaitingAt = 0;
+            console.log('[BG] setQueueWaiting false');
+        }
+        sendResponse({ success: true });
+        return false;
     }
     if (msg.action === 'manualStart') {
         console.log('[BG] manualStart requested from popup');
@@ -480,36 +520,45 @@ async function startFlowFromStorage() {
 
 async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
     try {
+        await checkQueueWaitingTimeout();
+        const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+        if (inQueueWaiting) {
+            console.log('[BG] inQueueWaiting is set - user is in queue (people ahead of you). Skipping openOrFocusTabs (no closing/creating tabs).');
+            return;
+        }
         const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
 
         console.log("event url:", eventUrl);
 
         // check if any tab with starting url: http://ticketmastersportuk.queue-it.net/ or https://web-identity than wait for 10 seconds
+        // Returns true if inQueueWaiting is set (abort openOrFocusTabs); false otherwise
         async function checkTabsAndWait() {
             const tabs = await chrome.tabs.query({});
             const matchTab = tabs.find(tab =>
-                //                  https://ticketmastersportuk.queue-it.net/
                 tab.url.startsWith("https://ticketmastersportuk.queue-it.net/") ||
-                 tab.url.startsWith("http://ticketmastersportuk.queue-it.net/")
+                tab.url.startsWith("http://ticketmastersportuk.queue-it.net/")
             );
 
             if (matchTab) {
+                const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+                if (inQueueWaiting) {
+                    console.log("[BG] Queue tab found and inQueueWaiting set - skipping wait and further actions.");
+                    return true; // abort
+                }
                 console.log("[BG] Before re opening tabs,Matching tab found:", matchTab.url);
-                console.log("[BG] Waiting 60 seconds...");
+                console.log("[BG] Waiting 120 seconds...");
 
-                // Wait using a Promise
-                await new Promise(resolve => setTimeout(resolve, 50000));
+                await new Promise(resolve => setTimeout(resolve, 120000));
 
                 console.log("[BG] 90 seconds passed, you can do something here.");
-                // Example: reload the tab
-                // await chrome.tabs.reload(matchTab.id);
             } else {
                 console.log("[BG] No matching tab found for queue or web identity related, ignoring");
             }
+            return false;
         }
 
         // check if queue or web identity tabs still there
-        await checkTabsAndWait();
+        if (await checkTabsAndWait()) return;
         // Close other eticketing tabs
         await closeOtherEticketingTabs();
 
@@ -552,7 +601,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
         }
         // check if queue or web identity tabs still there
-        await checkTabsAndWait();
+        if (await checkTabsAndWait()) return;
         // Close other eticketing tabs
         await closeOtherEticketingTabs();
 
@@ -577,7 +626,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
 
         // check if queue or web identity tabs still there
-        await checkTabsAndWait();
+        if (await checkTabsAndWait()) return;
         // Close other eticketing tabs
         await closeOtherEticketingTabs();
 
@@ -607,7 +656,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
             await new Promise(resolve => setTimeout(resolve, 30000));
         }
         // check if queue or web identity tabs still there
-        await checkTabsAndWait();
+        if (await checkTabsAndWait()) return;
         // Close other eticketing tabs
         await closeOtherEticketingTabs();
 
@@ -727,26 +776,28 @@ async function closeOtherEticketingTabs() {
         }
     }
 
-    // Close all tabs whose URL starts with https://ticketmastersportuk.queue-it.net/
-    chrome.tabs.query({}, (tabs) => {
-        tabs.forEach(tab => {
-            // Skip closing tabs that have "checkout" in the URL
-            if (tab.url && tab.url.toLowerCase().includes('checkout')) {
-                console.log('[BG] Skipping checkout tab:', tab.id, tab.url);
-                return;
-            }
-            
-            if (tab.url && tab.url.startsWith('https://ticketmastersportuk.queue-it.net/')) {
-                chrome.tabs.remove(tab.id, () => {
-                    if (chrome.runtime.lastError) {
-                        console.warn('Failed to close tab:', tab.id, chrome.runtime.lastError);
-                    } else {
-                        console.log('Closed tab:', tab.id, tab.url);
-
-
-                    }
-                });
-            }
+    // Close all tabs whose URL starts with https://ticketmastersportuk.queue-it.net/ (unless user is in queue waiting)
+    chrome.storage.local.get('inQueueWaiting').then(({ inQueueWaiting }) => {
+        if (inQueueWaiting) {
+            console.log('[BG] inQueueWaiting is set - not closing queue tab(s).');
+            return;
+        }
+        chrome.tabs.query({}, (tabs) => {
+            tabs.forEach(tab => {
+                if (tab.url && tab.url.toLowerCase().includes('checkout')) {
+                    console.log('[BG] Skipping checkout tab:', tab.id, tab.url);
+                    return;
+                }
+                if (tab.url && tab.url.startsWith('https://ticketmastersportuk.queue-it.net/')) {
+                    chrome.tabs.remove(tab.id, () => {
+                        if (chrome.runtime.lastError) {
+                            console.warn('Failed to close tab:', tab.id, chrome.runtime.lastError);
+                        } else {
+                            console.log('Closed tab:', tab.id, tab.url);
+                        }
+                    });
+                }
+            });
         });
     });
 
@@ -754,6 +805,11 @@ async function closeOtherEticketingTabs() {
 }
 
 async function refreshEventTab() {
+    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+    if (inQueueWaiting) {
+        console.log('[BG] inQueueWaiting is set - skipping refreshEventTab (user in queue).');
+        return { success: false, message: 'In queue, skipped' };
+    }
     console.warn('[BG] refreshEventTab trying to find eventTab with event url');
     const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
     const eventTabs = tabs.filter(tab => tab.url.includes('EDP/Event/Index/'));

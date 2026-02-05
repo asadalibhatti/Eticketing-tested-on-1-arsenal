@@ -10,7 +10,8 @@
     "notifications",
     "activeTab",
     "management",
-    "cookies"
+    "cookies",
+    "alarms"
   ],
   "host_permissions": [
     "https://www.eticketing.co.uk/*",
