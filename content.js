@@ -357,6 +357,7 @@ let checksheet = true;//read sheet one time and not next and so on
 
 // Separate error counters for different error types
 let error403Count = 0;           // For 403 Forbidden errors
+let justRefreshedDueTo403 = false; // true after a refresh due to 403; next 403 triggers clear cookies + refresh
 let tunnelTimeoutErrorCount = 0; // For tunnel connection and timeout errors
 let corsErrorCount = 0;          // For CORS errors
 let notfound400erorsCount = 0;   // For other HTTP errors (400, 401, 402, 302, 500)
@@ -369,58 +370,25 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
     // Get PriceClassId for this club
     const priceClassId = getPriceClassIdForClub(clubname);
 
-    // Get areaIds and areasToIgnore filters from local storage
     const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
-    console.log(`[INFO] Direct add to basket - areaIds filter:`, areaIds);
-    console.log(`[INFO] Direct add to basket - areasToIgnore filter:`, areasToIgnore);
-    
-    // Parse areaIds if provided (comma-separated string like "15,16,17")
-    let allowedAreaIds = null;
+    let allowedSet = null;
     if (areaIds && areaIds.trim() !== '') {
-        allowedAreaIds = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
-        console.log(`[INFO] Direct add to basket - parsed areaIds:`, allowedAreaIds);
-    } else {
-        console.log(`[INFO] Direct add to basket - no areaIds filter, will try all areas`);
+        const arr = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        allowedSet = arr.length ? new Set(arr) : null;
     }
-    
-    // Parse areasToIgnore if provided
-    let ignoredAreaIds = null;
+    let ignoredSet = null;
     if (areasToIgnore && areasToIgnore.trim() !== '') {
-        ignoredAreaIds = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
-        console.log(`[INFO] Direct add to basket - parsed areasToIgnore:`, ignoredAreaIds);
-    }
-    
-    // Filter areas based on areaIds and areasToIgnore settings
-    const areasToTry = data.filter(area => {
-        // If allowedAreaIds is specified, only include areas in the allowed list
-        if (allowedAreaIds && allowedAreaIds.length > 0) {
-            if (!allowedAreaIds.includes(area.AreaId)) return false;
-        }
-        
-        // If ignoredAreaIds is specified, exclude areas in the ignore list
-        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
-            if (ignoredAreaIds.includes(area.AreaId)) return false;
-        }
-        
-        return true;
-    });
-    
-    console.log(`[INFO] Direct add to basket - filtering areas: ${data.length} total, ${areasToTry.length} after filter`);
-    if (allowedAreaIds && allowedAreaIds.length > 0) {
-        console.log(`[INFO] Direct add to basket - allowed area IDs:`, allowedAreaIds);
-    }
-    if (ignoredAreaIds && ignoredAreaIds.length > 0) {
-        console.log(`[INFO] Direct add to basket - ignored area IDs:`, ignoredAreaIds);
-    }
-    console.log(`[INFO] Direct add to basket - filtered area IDs:`, areasToTry.map(a => a.AreaId).join(', '));
-    
-    // If no areas match the filter, return false
-    if (areasToTry.length === 0) {
-        console.warn(`[INFO] Direct add to basket - no areas match the areaIds filter`);
-        return false;
+        const arr = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        ignoredSet = arr.length ? new Set(arr) : null;
     }
 
-    // Loop over filtered areas in reverse order
+    const areasToTry = data.filter(area => {
+        if (allowedSet && !allowedSet.has(area.AreaId)) return false;
+        if (ignoredSet && ignoredSet.has(area.AreaId)) return false;
+        return true;
+    });
+    if (areasToTry.length === 0) return false;
+
     for (let a = areasToTry.length - 1; a >= 0; a--) {
         const area = areasToTry[a];
 
@@ -732,27 +700,14 @@ async function checkOnce() {
     }
 
     const clubName = getClubName(monitor.eventUrl);
-    console.log('[CS] checking if seats available ');
-    // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableResale? AreSeatsTogether=false&EventId=3631&MarketType=1&MaximumPrice=10000000&MinimumPrice=0&Quantity=1
-    // https://www.eticketing.co.uk/arsenal/EDP/Seats/AvailableRegular?AreSeatsTogether=false&EventId=3631&             MaximumPrice=10000000&MinimumPrice=0&Quantity=1
-
-    // Randomly select between regular and resale endpoints (96% Resale, 4% Regular)
-    // For manual override, uncomment the line below and set to true/false as needed
-    // const isResale = true;
-    
-    // Generate a more accurate 96% distribution using a counter-based approach
     const isResale = (() => {
-        // Use a combination of timestamp and random for better distribution
         const now = Date.now();
         const randomSeed = Math.random();
         const combinedSeed = (now % 1000) + (randomSeed * 1000);
-        return (combinedSeed % 100) < 96;//chances of resale
+        return (combinedSeed % 100) < 96;
     })();
     const endpointType = isResale ? 'Resale' : 'Regular';
     const marketTypeParam = isResale ? '&MarketType=1' : '';
-    
-    console.log(`[CS] Randomly selected __${endpointType} endpoint for this check (96% Resale bias)`);
-    
     const url = `https://www.eticketing.co.uk/${clubName}/EDP/Seats/Available${endpointType}?AreSeatsTogether=${monitor.areSeatsTogether}&EventId=${monitor.eventId}${marketTypeParam}&MaximumPrice=10000000&MinimumPrice=0&Quantity=${monitor.quantity}`;
 
     let res;
@@ -770,10 +725,10 @@ async function checkOnce() {
         // Reset queue-it error count on successful fetch
         // queueItErrorCount = 0;
 
-        // Detect if redirected to queue-it.net
-        if (res.url.includes('queue-it.net')) {
+        // Detect if redirected to queue (queue-it.net or hd-queue.eticketing.co.uk)
+        if (res.url.includes('queue-it.net') || res.url.includes('hd-queue.eticketing.co.uk')) {
             queueItErrorCount++;
-            console.warn('[CS] Redirected to queue-it.net, count:', queueItErrorCount);
+            console.warn('[CS] Redirected to queue page, count:', queueItErrorCount);
 
             if (queueItErrorCount >= 1) {
                 console.warn('[CS] 1 consecutive queue-it redirects (count:', queueItErrorCount, '), refreshing...');
@@ -831,36 +786,37 @@ async function checkOnce() {
         return;
     }
 
-    console.log('[CS] seats response status', res.status);
-    
     // Only reset all error counters on successful 200 status
     if (res.status === 200) {
         error403Count = 0;
+        justRefreshedDueTo403 = false;
         tunnelTimeoutErrorCount = 0;
         corsErrorCount = 0;
         notfound400erorsCount = 0;
         queueItErrorCount = 0;
     }
-    
+
     // Handle 403 errors separately
     if (res.status === 403) {
+        // If we already refreshed once due to 403 and get 403 again on next check -> clear cookies and refresh immediately
+        if (justRefreshedDueTo403) {
+            console.warn('[CS] 403 after refresh — clearing cookies and refreshing.');
+            justRefreshedDueTo403 = false;
+            error403Count = 0;
+            chrome.runtime.sendMessage({ action: 'clearCookiesAndRefresh' });
+            await delay(2000);
+            await refreshEventTabWithTracking();
+            return;
+        }
+
         error403Count++;
         console.warn('[CS] received 403 Forbidden error from check seats availability API, count:', error403Count);
 
-        // If reached 6 consecutive 403 errors -> refresh
         if (error403Count >= 6) {
-            console.warn('[CS] 6 consecutive 403 errors (count:', error403Count, ') — refreshing tab.');
+            console.warn('[CS] 6 consecutive 403 errors — refreshing tab.');
             await refreshEventTabWithTracking();
-            error403Count = 0; // reset after refresh
-        }
-
-        // If reached 11 consecutive 403 errors -> clear cookies + refresh
-        if (error403Count >= 9) {
-            console.warn('[CS] 9 consecutive 403 errors (count:', error403Count, ') — requesting cookie clear & refresh.');
-            chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
-            await delay(2000);
-            await refreshEventTabWithTracking();
-            error403Count = 0; // reset error counter
+            justRefreshedDueTo403 = true;
+            error403Count = 0;
         }
 
         return;
@@ -903,116 +859,48 @@ async function checkOnce() {
 // ✅ All error counters already reset above on 200 status
 
     if (!Array.isArray(data) || data.length === 0) {
-        //after waitMs
-        console.log('[CS] no seats available (empty array). will retry after 13 seconds\n\n');
-
+        console.log('[CS] Seat not found');
         return;
-
     }
 
-
-    const areaIdsList = data.map(a => a.AreaId).join(', ');
-    console.log(`[CS] Found ${data.length} area(s): ${areaIdsList}`);
-    
-    // Get areaIds to monitor from local storage
     const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
-    
-    // Parse areaIds if provided (comma-separated string like "15,16,17")
-    let allowedAreaIds = null;
+    let allowedSet = null;
     if (areaIds && areaIds.trim() !== '') {
-        allowedAreaIds = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        const arr = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        allowedSet = arr.length ? new Set(arr) : null;
     }
-    
-    // Parse areasToIgnore if provided
-    let ignoredAreaIds = null;
+    let ignoredSet = null;
     if (areasToIgnore && areasToIgnore.trim() !== '') {
-        ignoredAreaIds = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        const arr = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+        ignoredSet = arr.length ? new Set(arr) : null;
     }
-    
-    if (allowedAreaIds && allowedAreaIds.length > 0) {
-        console.log(`[CS] Monitoring ${allowedAreaIds.length} area(s): ${allowedAreaIds.join(', ')}`);
+
+    let area = null;
+    for (let i = 0; i < data.length; i++) {
+        const a = data[i];
+        if (!a.PriceBands || !a.PriceBands.length) continue;
+        if (allowedSet && !allowedSet.has(a.AreaId)) continue;
+        if (ignoredSet && ignoredSet.has(a.AreaId)) continue;
+        area = a;
+        break;
     }
-    if (ignoredAreaIds && ignoredAreaIds.length > 0) {
-        console.log(`[CS] Ignoring ${ignoredAreaIds.length} area(s)`);
+    if (!area && (allowedSet || ignoredSet)) {
+        if (allowedSet) return;
+        area = data.find(a => a.PriceBands && a.PriceBands.length && (!ignoredSet || !ignoredSet.has(a.AreaId))) || data[0];
     }
-    
-    // Filter areas based on areaIds and areasToIgnore settings
-    // If areaIds is provided, only include areas in that list
-    // If areasToIgnore is provided, exclude areas in that list
-    // If both are empty, include all areas
-    const preferredAreas = data.filter(a => {
-        if (!a.PriceBands || !a.PriceBands.length) return false;
-        
-        // If areaIds is specified, only include areas in the allowed list
-        if (allowedAreaIds && allowedAreaIds.length > 0) {
-            if (!allowedAreaIds.includes(a.AreaId)) return false;
-        }
-        
-        // If areasToIgnore is specified, exclude areas in the ignore list
-        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
-            if (ignoredAreaIds.includes(a.AreaId)) return false;
-        }
-        
-        return true;
-    });
-    
-    // If no preferred areas found, check if filters were applied
-    if (preferredAreas.length === 0) {
-        // If areaIds filter was specified but no matches found, return early
-        if (allowedAreaIds && allowedAreaIds.length > 0) {
-            console.log(`[CS] No matching areas found (monitoring: ${allowedAreaIds.join(', ')}, available: ${areaIdsList})`);
-            return;
-        }
-        
-        // If areasToIgnore filter was specified but all areas were filtered out, return early
-        if (ignoredAreaIds && ignoredAreaIds.length > 0) {
-            console.log(`[CS] All areas ignored (${areaIdsList} in ignore list) - skipping`);
-            return;
-        }
-        
-        // If no filters were specified (both empty), fall back to any available area
-        console.log('[CS] No preferred areas found, using any available area');
-    } else {
-        const preferredIds = preferredAreas.map(a => a.AreaId).join(', ');
-        console.log(`[CS] ${preferredAreas.length} area(s) after filtering: ${preferredIds}`);
-    }
-    
-    // Select area from preferredAreas if available
-    // Only fall back to original data if no filters were specified (both areaIds and areasToIgnore are empty)
-    const area = preferredAreas.length > 0 
-        ? preferredAreas[preferredAreas.length - 1] 
-        : (data.find(a => a.PriceBands && a.PriceBands.length) || data[0]);
-    
-    // Double-check: if area is in ignore list and ignore list is specified, this should not happen
-    if (ignoredAreaIds && ignoredAreaIds.length > 0 && area && ignoredAreaIds.includes(area.AreaId)) {
-        console.error('[CS] ERROR: Selected area is in ignore list! AreaId:', area.AreaId);
-        return;
-    }
-    
+    if (!area) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
+
     const priceBand = area.PriceBands[0];
     const areaId = area.AreaId;
-    const priceBandId = priceBand.PriceBandCode ;
-    
-    console.log(`[CS] Selected area ${areaId}, price band ${priceBandId}`);
+    const priceBandId = priceBand.PriceBandCode;
 
 
-    // Step 1: Get the token from localStorage
     let verificationToken = localStorage.getItem("verification_token");
-
     if (!verificationToken) {
-        console.error('❌ Verification token not found in localStorage.');
-        //use default token if not found
-        console.log('Using default verification token: MOn7sdIDdiCrtszHY1RszN2HcxXfJZh4u5JWRkfGzwqplL9l_wSMkXYhJl3VRBglbAZvjJqeNQLamfQkFoO78OD1eLA1');
         verificationToken = 'MOn7sdIDdiCrtszHY1RszN2HcxXfJZh4u5JWRkfGzwqplL9l_wSMkXYhJl3VRBglbAZvjJqeNQLamfQkFoO78OD1eLA1';
     }
-    // console.log('✅ Token from localStorage:', verificationToken);
 
-    // 2a api Lock seats (POST)
-    //               https://www.eticketing.co.uk/arsenal/EDP/BestAvailable/ResaleSeats
-    // https://www.eticketing.co.uk/chelseafc/EDP/Ism/SelectRegularSeat
     const lockUrl = `https://www.eticketing.co.uk/${clubName}/EDP/BestAvailable/${endpointType}Seats`;
-    console.log(`[CS] Using ${endpointType} endpoint for locking seats: ${lockUrl}`);
-// Step 2: Prepare body
     const lockBody = {
         EventId: monitor.eventId,
         Quantity: monitor.quantity,
@@ -1023,7 +911,6 @@ async function checkOnce() {
         MinimumPrice: 0,
         MaximumPrice: 10000000
     };
-    console.log('[CS] locking seats with body', lockBody);
 
     let lockRes;
     try {
@@ -1049,31 +936,19 @@ async function checkOnce() {
             body: JSON.stringify(lockBody)
         });
     } catch (e) {
-        console.error('[CS] lock fetch failed', e);
-        //send message to webhook
+        console.warn('[CS] Seats found (AreaId ' + areaId + ', PriceBand ' + priceBandId + ') but lock failed:', e.message);
         const email = await getEmailForNotification();
-        const errorMessage = `\n\nError locking seats: ${e.message} for received data ${JSON.stringify(data)}\n👤 **Account:** ${email}`;
-        
-        
-        // Also send to background for error webhook dispatch
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: errorMessage,
+            message: `\n\nError locking seats: ${e.message} for AreaId ${areaId} PriceBandId ${priceBandId}\n👤 **Account:** ${email}`,
             payload: null
         });
-        
         return;
     }
 
-    console.log('[CS] lock response status', lockRes.status);
-    
-    // Handle different lock response statuses
-    if (lockRes.status === 403 ) {
-        console.warn('[CS] lock got 403 Forbidden, trying to add directly to basket with 2nd api');
-
-        // try direct add to basket with 2nd api
+    if (lockRes.status === 403) {
         if (!(await tryDirectAddToBasketSecondapi(data, clubName, monitor.eventId, verificationToken, endpointType))) {
-            console.warn('[CS] direct add to basket failed for all areas, stopping monitoring');
+            console.warn('[CS] Seats found but lock 403 and direct add to basket failed for all areas');
             
             // Send webhook message about the failure
             const email = await getEmailForNotification();
@@ -1084,46 +959,27 @@ async function checkOnce() {
                 payload: null
             });
             
-            // stop monitoring if no seats available
             return;
         }
-        console.log('[CS] direct add to basket successful, going to next lines to send notifications');
-        // return;
     } else if (lockRes.status === 400 || lockRes.status === 404) {
-        console.warn('[CS] lock got 400/404, likely issue with verification token or no seats available');
-        
-        //get response html text only not html and also send in discord message
         lockResponseHtmlText = await lockRes.text();
-        //get only text
-        lockResponseHtmlText = lockResponseHtmlText.replace(/<[^>]*>?/g, '');
-        //remove all break lines or \n from text
-        lockResponseHtmlText = lockResponseHtmlText.replace(/\n/g, '');
-        console.log('[CS] lock response html text', lockResponseHtmlText);
-
-        //send to background for error webhook dispatch
-        
-        // Send webhook message about the failure
+        lockResponseHtmlText = lockResponseHtmlText.replace(/<[^>]*>?/g, '').replace(/\n/g, '');
+        console.warn('[CS] Seats found (AreaId ' + areaId + ', PriceBand ' + priceBandId + ') but lock failed with status', lockRes.status);
         const email = await getEmailForNotification();
-        const errorMessage = `\n🎫 Seat with areaId ${areaId} priceBandId ${priceBandId} found but not locked Status: ${lockRes.status}\n👤 **Account:** ${email}`;
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: errorMessage,
+            message: `\n🎫 Seat AreaId ${areaId} PriceBandId ${priceBandId} found but not locked. Status: ${lockRes.status}\n👤 **Account:** ${email}`,
             payload: null
         });
-
         return;
     } else if (lockRes.status !== 200) {
-        // Handle any other non-200 status codes
+        console.warn('[CS] Seats found (AreaId ' + areaId + ') but lock failed with status', lockRes.status);
         const email = await getEmailForNotification();
-        const errorMessage = `🎫 Error locking seats: ${lockRes.status} for received data ${JSON.stringify(data)}\n👤 **Account:** ${email}`;
-        console.warn('[CS] sending error notification:', errorMessage);
-        
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: errorMessage,
+            message: `🎫 Error locking seats: ${lockRes.status} for AreaId ${areaId}\n👤 **Account:** ${email}`,
             payload: null
         });
-
         return;
     } else {
 
@@ -1137,38 +993,19 @@ async function checkOnce() {
 
         const lockedSeats = lockJson?.LockedSeats;
         if (!lockedSeats || lockedSeats.length === 0) {
-            console.warn('[CS] no LockedSeats in response', lockJson);
+            console.warn('[CS] Seats found but no LockedSeats in lock response');
             return;
         }
-        console.log('[CS] LockedSeats', lockedSeats);
 
-        // Get PriceClassId for this club
         const priceClassId = getPriceClassIdForClub(clubName);
-
-        // Determine how many seats to add to basket
-        let seatsToAdd = [];
-        
+        let seatsToAdd;
         if (monitor.areSeatsTogether && monitor.quantity > 1) {
-            // When seats together is true and quantity > 1, add all locked seats
-            seatsToAdd = lockedSeats.map(seat => ({
-                Id: seat.Id,
-                PriceClassId: priceClassId
-            }));
-            console.log('[CS] Adding all locked seats to basket (areSeatsTogether=true, quantity=' + monitor.quantity + ')');
+            seatsToAdd = lockedSeats.map(seat => ({ Id: seat.Id, PriceClassId: priceClassId }));
         } else {
-            // When seats together is false or quantity is 1, add only the first seat
-            seatsToAdd = [{Id: lockedSeats[0].Id, PriceClassId: priceClassId}];
-            console.log('[CS] Adding only first locked seat to basket (areSeatsTogether=' + monitor.areSeatsTogether + ', quantity=' + monitor.quantity + ')');
+            seatsToAdd = [{ Id: lockedSeats[0].Id, PriceClassId: priceClassId }];
         }
 
-        // Adding to basket (PUT)
-        const putBody = {
-            EventId: monitor.eventId,
-            Seats: seatsToAdd
-        };
-
-
-        console.log('[CS] adding to basket with body', putBody);
+        const putBody = { EventId: monitor.eventId, Seats: seatsToAdd };
         let putRes;
         try {
             putRes = await fetch(lockUrl, {
@@ -1195,8 +1032,7 @@ async function checkOnce() {
             console.error('[CS] add to basket fetch failed', e);
             return;
         }
-        console.log('[CS] add to basket status', putRes.status);
-       
+
         // Check if add to basket failed (not 200 or 201)
         if (putRes.status !== 200 && putRes.status !== 201) {
             console.error('[CS] Seat locked but failed to add to basket (status', putRes.status + ')');

@@ -316,6 +316,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ success: true });
         return false;
     }
+    if (msg.action === 'clearCookiesAndReopenInSameTab') {
+        if (!sender.tab) {
+            sendResponse({ success: false, message: 'Only content script can request' });
+            return false;
+        }
+        const tabId = sender.tab.id;
+        console.log('[BG] clearCookiesAndReopenInSameTab from queue tab', tabId);
+        chrome.cookies.getAll({}, async function (cookies) {
+            cookies.forEach(cookie => {
+                chrome.cookies.remove({
+                    url: `https://${cookie.domain}${cookie.path}`,
+                    name: cookie.name
+                }, () => {});
+            });
+            const { eventUrl } = await chrome.storage.local.get('eventUrl');
+            if (eventUrl) {
+                await chrome.tabs.update(tabId, { url: eventUrl });
+                console.log('[BG] Reopened event URL in same tab:', eventUrl);
+            }
+            sendResponse({ success: true });
+        });
+        return true;
+    }
     if (msg.action === 'manualStart') {
         console.log('[BG] manualStart requested from popup');
         startFlowFromStorage();
@@ -530,13 +553,13 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
         console.log("event url:", eventUrl);
 
-        // check if any tab with starting url: http://ticketmastersportuk.queue-it.net/ or https://web-identity than wait for 10 seconds
+        // check if any tab with starting url: hd-queue.eticketing.co.uk or https://web-identity than wait for 10 seconds
         // Returns true if inQueueWaiting is set (abort openOrFocusTabs); false otherwise
         async function checkTabsAndWait() {
             const tabs = await chrome.tabs.query({});
             const matchTab = tabs.find(tab =>
-                tab.url.startsWith("https://ticketmastersportuk.queue-it.net/") ||
-                tab.url.startsWith("http://ticketmastersportuk.queue-it.net/")
+                tab.url.startsWith("https://hd-queue.eticketing.co.uk/") ||
+                tab.url.startsWith("http://hd-queue.eticketing.co.uk/")
             );
 
             if (matchTab) {
@@ -546,11 +569,11 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                     return true; // abort
                 }
                 console.log("[BG] Before re opening tabs,Matching tab found:", matchTab.url);
-                console.log("[BG] Waiting 120 seconds...");
+                console.log("[BG] Waiting 130 seconds...");
 
-                await new Promise(resolve => setTimeout(resolve, 120000));
+                await new Promise(resolve => setTimeout(resolve, 130000));
 
-                console.log("[BG] 90 seconds passed, you can do something here.");
+                console.log("[BG] 130 seconds passed, you can do something here.");
             } else {
                 console.log("[BG] No matching tab found for queue or web identity related, ignoring");
             }
@@ -696,22 +719,22 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
         }
 
 
-        //if there are more than 1 event tab close other event tabs only keep one tab open
+        //if there are more than 1 event tab close other event tabs only keep one tab open (never close tabs with Checkout in URL)
         const eventTabs = tabs2.filter(t => t.url && t.url.startsWith(eventUrl));
         if (eventTabs.length > 1) {
             console.log('[BG] More than 1 event tab found, closing other event tabs');
             for (const t of eventTabs) {
-                if (t.id !== eventTabId) {
+                if (t.id !== eventTabId && t.url && !t.url.toLowerCase().includes('checkout')) {
                     await chrome.tabs.remove(t.id);
                 }
             }
         }
-        //if there are more than 1 not allowed tab close other not allowed tabs only keep one tab open
+        //if there are more than 1 not allowed tab close other not allowed tabs only keep one tab open (never close tabs with Checkout in URL)
         const notAllowedTabs = tabs2.filter(t => t.url && t.url.startsWith(EVENT_NOT_ALLOWED_URL));
         if (notAllowedTabs.length > 1) {
             console.log('[BG] More than 1 not allowed tab found, closing other not allowed tabs');
             for (const t of notAllowedTabs) {
-                if (t.id !== notAllowedTabId) {
+                if (t.id !== notAllowedTabId && t.url && !t.url.toLowerCase().includes('checkout')) {
                     await chrome.tabs.remove(t.id);
                 }
             }
@@ -776,7 +799,7 @@ async function closeOtherEticketingTabs() {
         }
     }
 
-    // Close all tabs whose URL starts with https://ticketmastersportuk.queue-it.net/ (unless user is in queue waiting)
+    // Close all tabs whose URL starts with hd-queue.eticketing.co.uk (unless user is in queue waiting)
     chrome.storage.local.get('inQueueWaiting').then(({ inQueueWaiting }) => {
         if (inQueueWaiting) {
             console.log('[BG] inQueueWaiting is set - not closing queue tab(s).');
@@ -788,7 +811,7 @@ async function closeOtherEticketingTabs() {
                     console.log('[BG] Skipping checkout tab:', tab.id, tab.url);
                     return;
                 }
-                if (tab.url && tab.url.startsWith('https://ticketmastersportuk.queue-it.net/')) {
+                if (tab.url && (tab.url.startsWith('https://hd-queue.eticketing.co.uk/') || tab.url.startsWith('http://hd-queue.eticketing.co.uk/'))) {
                     chrome.tabs.remove(tab.id, () => {
                         if (chrome.runtime.lastError) {
                             console.warn('Failed to close tab:', tab.id, chrome.runtime.lastError);

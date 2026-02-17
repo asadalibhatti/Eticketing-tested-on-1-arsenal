@@ -2,28 +2,49 @@
 
 console.log("[QueueIt Script] Script loaded on:", window.location.href);
 
-/** Returns true if the page shows "people ahead of you" (user is in queue and must wait). */
+/** Returns true if the page shows "people ahead of you" or progress bar (user is in queue and must wait). */
 function hasPeopleAheadOfYouVisible() {
-    const el = document.querySelector('#MainPart_lbUsersInLineAheadOfYouText');
-    if (!el) return false;
-    const text = (el.textContent || '').trim();
-    if (text.indexOf('people ahead of you') === -1) return false;
-    const style = window.getComputedStyle(el);
-    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+    // Check for "people ahead of you" text
+    const peopleAheadEl = document.querySelector('#MainPart_lbUsersInLineAheadOfYouText');
+    if (peopleAheadEl) {
+        const text = (peopleAheadEl.textContent || '').trim();
+        if (text.indexOf('people ahead of you') !== -1) {
+            const style = window.getComputedStyle(peopleAheadEl);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && peopleAheadEl.offsetParent !== null) {
+                return true;
+            }
+        }
+    }
+    
+    // Check for progress bar (queue position update indicator)
+    const progressBar = document.querySelector('#MainPart_divProgressbar');
+    if (progressBar) {
+        const style = window.getComputedStyle(progressBar);
+        if (style.display !== 'none' && style.visibility !== 'hidden' && progressBar.offsetParent !== null) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 /** Send setQueueWaiting message to background every 3s so background knows we're still in queue; background clears flag if no message in 10s. */
 function sendQueueWaitingToBackground() {
-    const onQueueUrl = window.location.href.startsWith('https://ticketmastersportuk.queue-it.net') ||
-        window.location.href.startsWith('http://ticketmastersportuk.queue-it.net');
+    const onQueueUrl = window.location.href.startsWith('https://hd-queue.eticketing.co.uk') ||
+        window.location.href.startsWith('http://hd-queue.eticketing.co.uk');
     const waiting = onQueueUrl && hasPeopleAheadOfYouVisible();
+    if (waiting) queueFlagEverSeen = true;
     chrome.runtime.sendMessage({ action: 'setQueueWaiting', inQueueWaiting: waiting }, () => {
         if (chrome.runtime.lastError) return;
-        if (waiting) console.log("[QueueIt Script] In queue (people ahead of you) - sent setQueueWaiting true");
+        if (waiting) console.log("[QueueIt Script] In queue (people ahead or progress bar visible) - sent setQueueWaiting true");
     });
 }
 
-if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net")) {
+let queueFlagEverSeen = false; // true if "people ahead" or progress bar has been visible at any time on this page
+let joinWaitingRoomButtonClicked = false; // track if "Join waiting room" button was clicked
+let confirmRedirectButtonClicked = false; // track if "Yes, please" confirm redirect button was clicked
+
+if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || window.location.href.startsWith("http://hd-queue.eticketing.co.uk")) {
     console.log("[QueueIt Script] Running on the correct page.");
 
     if (document.readyState === 'loading') {
@@ -35,6 +56,16 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
     // Send setQueueWaiting to background every 3s; background clears flag if no message in 10s
     setInterval(sendQueueWaitingToBackground, 3000);
     sendQueueWaitingToBackground(); // run once on load
+
+    // If neither "people ahead" nor progress bar appears after 120s, clear cookies and reopen event URL in same tab (do not clear if flag was ever seen)
+    setTimeout(() => {
+        if (queueFlagEverSeen) return;
+        if (hasPeopleAheadOfYouVisible()) return;
+        console.log("[QueueIt Script] No queue indicators after 120s - clearing cookies and reopening event URL in same tab");
+        chrome.runtime.sendMessage({ action: 'clearCookiesAndReopenInSameTab' }, () => {
+            if (chrome.runtime.lastError) console.error('[QueueIt Script] clearCookiesAndReopenInSameTab error:', chrome.runtime.lastError);
+        });
+    }, 120000);
 
     function startQueueItScript() {
         console.log("[QueueIt Script] Starting queue-it script...");
@@ -54,6 +85,28 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
                 console.log("[QueueIt Script] Stopping checks after max attempts");
                 clearInterval(checkElements);
                 return;
+            }
+
+            // --- Click "Join waiting room" button as soon as it appears ---
+            const joinWaitingRoomButton = document.querySelector('button.botdetect-button.btn');
+            if (joinWaitingRoomButton && !joinWaitingRoomButtonClicked) {
+                const buttonText = (joinWaitingRoomButton.textContent || '').trim();
+                if (buttonText === 'Join waiting room') {
+                    joinWaitingRoomButtonClicked = true;
+                    console.log("[QueueIt Script] 'Join waiting room' button found, clicking immediately...");
+                    joinWaitingRoomButton.click();
+                }
+            }
+
+            // --- Click "Yes, please" confirm redirect button as soon as it appears ---
+            const confirmRedirectButton = document.querySelector('button#buttonConfirmRedirect');
+            if (confirmRedirectButton && !confirmRedirectButtonClicked) {
+                const text = (confirmRedirectButton.textContent || '').trim();
+                if (text.indexOf('Yes, please') !== -1) {
+                    confirmRedirectButtonClicked = true;
+                    console.log("[QueueIt Script] 'Yes, please' confirm redirect button found, clicking immediately...");
+                    confirmRedirectButton.click();
+                }
             }
 
             const captchaInput = document.querySelector('input#solution');
@@ -105,5 +158,5 @@ if (window.location.href.startsWith("https://ticketmastersportuk.queue-it.net"))
         }, 1000);
     }
 } else {
-    console.log("[QueueIt Script] Not running - URL doesn't match queue-it pattern");
+    console.log("[QueueIt Script] Not running - URL doesn't match queue pattern");
 }

@@ -30,7 +30,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://ticketmastersportuk.queue-it.net/*"
+        "https://hd-queue.eticketing.co.uk/*",
+        "http://hd-queue.eticketing.co.uk/*"
       ],
       "js": [
         "queueit_script.js"
