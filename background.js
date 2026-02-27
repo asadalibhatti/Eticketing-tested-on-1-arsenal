@@ -339,6 +339,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         return true;
     }
+    if (msg.action === 'resetError403Count') {
+        chrome.storage.local.set({ error403Count: 0 });
+        console.log('[BG] error403Count reset to 0 (event URL loaded)');
+        sendResponse({ success: true });
+        return false;
+    }
+    if (msg.action === 'error403Detected') {
+        const detectedAt = new Date();
+        console.log('[BG] error403 detected at', detectedAt.toLocaleTimeString(), '- scheduling pause then resume (open/reload tabs).');
+        (async () => {
+            const { error403Count = 0 } = await chrome.storage.local.get('error403Count');
+            const waitMinutes = 5 + (error403Count * 3); // 5, 8, 11, 14... min
+            await chrome.storage.local.set({ error403Count: error403Count + 1 });
+            const waitMs = waitMinutes * 60 * 1000;
+            const pauseUntil = Date.now() + waitMs;
+            const resumeAt = new Date(pauseUntil);
+            error403PauseUntil = pauseUntil; // pause heartbeat reload until our resume runs
+            await chrome.storage.local.set({ error403PauseUntil: pauseUntil }); // so content script can pause seat checks
+            console.log(`[BG] error403: detected at ${detectedAt.toLocaleTimeString()}; occurrence #${error403Count + 1}, will resume at ${resumeAt.toLocaleTimeString()} (${waitMinutes} min wait); heartbeat and seat checks paused until then.`);
+            setTimeout(async () => {
+                const resumingAt = new Date();
+                error403PauseUntil = 0;
+                await chrome.storage.local.set({ error403PauseUntil: 0 }); // resume seat checks in validation tab
+                lastHeartbeat = null;
+                isFirstHeartbeat = true;
+                console.log('[BG] error403 resuming at', resumingAt.toLocaleTimeString());
+                const { sheetUrl, startSecond, eventUrl } = await chrome.storage.local.get(['sheetUrl', 'startSecond', 'eventUrl']);
+                const targetStartSecond = parseInt(startSecond ?? -2, 10);
+                let sheetStatusOn = false;
+                if (sheetUrl) {
+                    try {
+                        const gvizUrl = getGvizUrl(sheetUrl);
+                        if (gvizUrl) {
+                            const allCfg = await fetchSheetConfigAll(sheetUrl);
+                            const matchingRows = allCfg.filter(cfg =>
+                                ['on', 'start', 'true', '1'].includes((cfg.status || '').toString().trim().toLowerCase()) &&
+                                parseInt(cfg.startSecond, 10) === targetStartSecond
+                            );
+                            sheetStatusOn = matchingRows.length > 0;
+                        }
+                    } catch (e) {
+                        console.warn('[BG] error403 resume: could not read sheet status', e.message);
+                    }
+                }
+                if (!sheetStatusOn) {
+                    console.log('[BG] error403 resume: sheet status is Off - not opening/reloading tabs.');
+                    return;
+                }
+                if (!eventUrl) {
+                    console.warn('[BG] error403 resume: no eventUrl in storage, skipping refresh.');
+                    notifyValidationTabError403Resume();
+                    return;
+                }
+                EVENT_URL = eventUrl;
+                await chrome.storage.local.set({ inQueueWaiting: false });
+                lastSetQueueWaitingAt = 0;
+                console.log('[BG] error403 resume: sheet status On - refreshing event tab only.');
+                await refreshEventTab();
+                notifyValidationTabError403Resume(); // tell validation tab to resume seat check instantly
+                console.log("[BG] error403 resume done; heartbeat reset to initial 3-minute cycle.");
+            }, waitMs);
+        })();
+        sendResponse({ success: true });
+        return false;
+    }
     if (msg.action === 'manualStart') {
         console.log('[BG] manualStart requested from popup');
         startFlowFromStorage();
@@ -363,6 +428,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return true; // keep channel open for async response
     }
     if (msg.action === 'refreshEventTab') {
+        if (Date.now() < error403PauseUntil) {
+            console.log('[BG] refreshEventTab skipped - error403 pause active.');
+            sendResponse({ success: false, message: 'error403 pause active, skipped' });
+            return false;
+        }
         console.log('[BG] refreshEventTab requested', msg);
         Promise.resolve(refreshEventTab())
             .then(() => {
@@ -374,6 +444,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 sendResponse({success: false, message: err?.message || 'Unknown error'});
             });
         return true; // keep channel open for async response
+    }
+    if (msg.action === 'refreshEventTabAndCloseQueueTab') {
+        if (Date.now() < error403PauseUntil) {
+            console.log('[BG] refreshEventTabAndCloseQueueTab skipped - error403 pause active.');
+            sendResponse({ success: false, message: 'error403 pause active, skipped' });
+            return false;
+        }
+        if (!sender.tab) {
+            sendResponse({ success: false, message: 'No sender tab' });
+            return false;
+        }
+        const queueTabId = sender.tab.id;
+        console.log('[BG] refreshEventTabAndCloseQueueTab from queue tab', queueTabId);
+        chrome.tabs.remove(queueTabId, () => {
+            if (chrome.runtime.lastError) console.warn('[BG] close queue tab error:', chrome.runtime.lastError);
+            else console.log('[BG] Queue tab closed:', queueTabId);
+        });
+        Promise.resolve(refreshEventTab())
+            .then(() => {
+                sendResponse({ success: true, message: 'Queue tab closed, event tab refreshed' });
+            })
+            .catch(err => {
+                console.error('[BG] refreshEventTabAndCloseQueueTab error:', err);
+                sendResponse({ success: false, message: err?.message || 'Unknown error' });
+            });
+        return true;
     }
     if (msg.action === 'notifyWebhooks') {
         console.log('[BG] notifyWebhooks requested', msg);
@@ -543,6 +639,10 @@ async function startFlowFromStorage() {
 
 async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
     try {
+        if (Date.now() < error403PauseUntil) {
+            console.log('[BG] error403 pause active - skipping openOrFocusTabs.');
+            return;
+        }
         await checkQueueWaitingTimeout();
         const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
         if (inQueueWaiting) {
@@ -569,11 +669,15 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                     return true; // abort
                 }
                 console.log("[BG] Before re opening tabs,Matching tab found:", matchTab.url);
-                console.log("[BG] Waiting 130 seconds...");
+                console.log("[BG] Waiting 145 seconds (queue URL already open)...");
 
-                await new Promise(resolve => setTimeout(resolve, 130000));
+                await new Promise(resolve => setTimeout(resolve, 145000));
 
-                console.log("[BG] 130 seconds passed, you can do something here.");
+                console.log("[BG] 145 seconds passed, you can do something here.");
+                if (Date.now() < error403PauseUntil) {
+                    console.log("[BG] error403 pause active - aborting openOrFocusTabs (no tab close/reopen until resume).");
+                    return true;
+                }
             } else {
                 console.log("[BG] No matching tab found for queue or web identity related, ignoring");
             }
@@ -619,9 +723,13 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
                 eventTabId = created.id;
 
             }
-            // //wait for 50 seconds here
-            await new Promise(resolve => setTimeout(resolve, 20000));
+            // Wait before opening validation tab (after event tab)
+            await new Promise(resolve => setTimeout(resolve, 50000)); // 50 seconds
 
+        }
+        if (Date.now() < error403PauseUntil) {
+            console.log("[BG] error403 pause active - skipping rest of openOrFocusTabs.");
+            return;
         }
         // check if queue or web identity tabs still there
         if (await checkTabsAndWait()) return;
@@ -647,7 +755,10 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
         // Wait for 40 seconds
         await new Promise(resolve => setTimeout(resolve, 10000));
 
-
+        if (Date.now() < error403PauseUntil) {
+            console.log("[BG] error403 pause active - skipping recheck and rest of openOrFocusTabs.");
+            return;
+        }
         // check if queue or web identity tabs still there
         if (await checkTabsAndWait()) return;
         // Close other eticketing tabs
@@ -655,6 +766,10 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
 
         // Recheck to ensure tabs are still valid
+        if (Date.now() < error403PauseUntil) {
+            console.log("[BG] error403 pause active - skipping recheck and rest of openOrFocusTabs.");
+            return;
+        }
         console.log("Recheck to ensure tabs are still valid and not redirected ")
         const tabs2 = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
 
@@ -825,6 +940,16 @@ async function closeOtherEticketingTabs() {
     });
 
 
+}
+
+/** Notify validation (EventNotAllowed) tabs that error403 pause ended so they resume seat checks instantly. */
+async function notifyValidationTabError403Resume() {
+    const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
+    const validationTabs = tabs.filter(t => t.url && t.url.includes('EDP/Validation/EventNotAllowed'));
+    for (const tab of validationTabs) {
+        chrome.tabs.sendMessage(tab.id, { action: 'error403Resume' }).catch(() => {});
+    }
+    if (validationTabs.length) console.log('[BG] Sent error403Resume to', validationTabs.length, 'validation tab(s)');
 }
 
 async function refreshEventTab() {
@@ -1090,6 +1215,7 @@ const SUBSEQUENT_HEARTBEAT_TIMEOUT = 120000; // 2 minutes for subsequent heartbe
 let lastHeartbeat = null; // store last heartbeat timestamp
 let isFirstHeartbeat = true; // track if this is the first heartbeat received
 let heartbeatMonitoringPaused = false; // track if heartbeat monitoring is paused
+let error403PauseUntil = 0; // timestamp (ms) until which heartbeat reload is skipped; set when error403 wait is active
 
 // Call this whenever you receive a heartbeat
 function updateHeartbeat() {
@@ -1106,6 +1232,11 @@ function updateHeartbeat() {
 
 setInterval(async () => {
     const now = Date.now();
+    
+    // During error403 wait, skip heartbeat reload so we only retry after our set minutes
+    if (now < error403PauseUntil) {
+        return;
+    }
     
     // Pause heartbeat monitoring when status is off
     if (lastStatus === "off") {

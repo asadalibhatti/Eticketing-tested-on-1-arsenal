@@ -1,5 +1,16 @@
 console.log('TICKET Checking content script loaded on', location.href);
 
+// When event page loads (e.g. after queue or error403 resume), reset queue error403 count so next time wait starts at 5 min
+(async () => {
+    const { eventUrl } = await chrome.storage.local.get('eventUrl');
+    const current = (location.href || '').split('?')[0];
+    const storedBase = eventUrl ? eventUrl.split('?')[0] : '';
+    if (storedBase && (current === storedBase || current.startsWith(storedBase + '/'))) {
+        chrome.runtime.sendMessage({ action: 'resetError403Count' }, () => {
+            if (!chrome.runtime.lastError) console.log('[CS] Event URL loaded - reset queue error403Count to 0');
+        });
+    }
+})();
 
 if (document.title.includes("Your Browsing Activity Has")) {
     console.log("[CS] Waiting for tab title to change...");
@@ -50,7 +61,6 @@ function getPriceClassIdForClub(clubName) {
     const priceClassId = clubPriceClassIdMap[normalizedClubName];
     
     if (priceClassId !== undefined) {
-        console.log(`[CS] Using PriceClassId ${priceClassId} for club: ${clubName}`);
         return priceClassId;
     }
     
@@ -73,6 +83,11 @@ function getPriceClassIdForClub(clubName) {
     }
 })();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.action === 'error403Resume') {
+        console.log('[CS] error403 pause ended - resuming seat check instantly');
+        if (monitor.running) runCheck();
+        return;
+    }
     if (window.location.search.includes("eventId=4&reason=EventArchived")) {
         if (msg.action === 'startMonitoring') {//start will be from backgroun script
             console.log('[CS] received startMonitoring', msg);
@@ -181,12 +196,22 @@ async function startMonitorFlow() {
 
 let lastScheduledTime = null; // stores the planned next run time
 let lastRealignTime = null;   // stores the timestamp of the last realignment
+let lastRunStartTime = null; // when runCheck() last started (used to log response time)
 
-function scheduleNextCheck() {
-    const waitMs = 13000; // interval between checks (ms)
-    const realignIntervalMs = 30000; // 1 minutes for realignment
+async function scheduleNextCheck() {
+    const waitMs = 12000; // exactly 12 seconds between each API call (realign every 2 min keeps drift small)
+    const realignIntervalMs = 120000; // 2 minutes for realignment
 
-    console.log(`\n===================================\n`);
+    // During error403 pause, poll every 5s so we resume quickly when flag clears
+    const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
+    if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
+        const pauseDelay = 5000;
+        const nextAt = new Date(Date.now() + pauseDelay);
+        console.log('[CS] Next seat API call in 5s at ' + nextAt.toLocaleTimeString() + ' (error403 pause, will retry when pause ends)');
+        chrome.runtime.sendMessage({ type: 'heartbeat' }).catch(() => {});
+        setTimeout(runCheck, pauseDelay);
+        return;
+    }
 
     const now = Date.now();
 
@@ -204,7 +229,7 @@ function scheduleNextCheck() {
         lastRealignTime = now;
 
         const nextRun = new Date(lastScheduledTime);
-        console.log(`[CS] First check aligned to startSecond=${base}, scheduled at ${nextRun.toLocaleTimeString()} (in ${(alignMs / 1000).toFixed(2)}s)`);
+        console.log('[CS] Next seat API call in ' + (alignMs / 1000).toFixed(1) + 's at ' + nextRun.toLocaleTimeString() + ' (first check aligned to startSecond=' + base + ')');
 
         setTimeout(runCheck, alignMs);
         return;
@@ -235,31 +260,32 @@ function scheduleNextCheck() {
         lastScheduledTime = newScheduledTime;
         lastRealignTime = now;
     } else {
-        // Normal increment by waitMs
+        // Normal increment by waitMs (next run is 12s after *scheduled* start of last run)
         lastScheduledTime += waitMs;
     }
 
+    // delay = lastScheduledTime - now automatically compensates for API response time:
+    // now ≈ (last run start) + responseTime, so delay = 12s - responseTime → next call starts 12s after previous start
     let delay = lastScheduledTime - now;
     // if delay is less than 7 seconds , increment it with waitMs
     if (delay < 7000) {
         delay += waitMs;
     }
 
-    const nextRun = new Date(lastScheduledTime);
-
-    console.log(`[CS] Next check scheduled at ${nextRun.toLocaleTimeString()} (in ${(delay / 1000).toFixed(2)}s)`);
-
-
+    const nextCallAt = new Date(now + delay);
+    const responseTimeMs = typeof lastRunStartTime === 'number' ? now - lastRunStartTime : null;
+    if (responseTimeMs != null) {
+        console.log('[CS] API+processing took ' + (responseTimeMs / 1000).toFixed(2) + 's, next seat API call in ' + (delay / 1000).toFixed(1) + 's at ' + nextCallAt.toLocaleTimeString());
+    } else {
+        console.log('[CS] Next seat API call in ' + (delay / 1000).toFixed(1) + 's at ' + nextCallAt.toLocaleTimeString());
+    }
     chrome.runtime.sendMessage({type: "heartbeat"});
     setTimeout(runCheck, delay);
 }
 
 async function runCheck() {
-    const runTime = new Date();
-    // console.log(`[CS] Running checkOnce at ${runTime.toLocaleTimeString()}`);
-
+    lastRunStartTime = Date.now();
     await checkOnce().catch(e => console.error('[CS] checkOnce err', e));
-
     if (monitor.running) scheduleNextCheck();
 }
 
@@ -363,7 +389,6 @@ let corsErrorCount = 0;          // For CORS errors
 let notfound400erorsCount = 0;   // For other HTTP errors (400, 401, 402, 302, 500)
 
 async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificationToken, endpointType = 'Regular') {
-    console.log(`[INFO] Using ${endpointType} endpoint for direct add to basket`);
     let successCount = 0;       // Track successful adds
     let totalFetchCount = 0;    // Track total fetch attempts
     
@@ -372,19 +397,21 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
 
     const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
     let allowedSet = null;
-    if (areaIds && areaIds.trim() !== '') {
-        const arr = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+    if (areaIds && String(areaIds).trim() !== '') {
+        const arr = String(areaIds).split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
         allowedSet = arr.length ? new Set(arr) : null;
     }
     let ignoredSet = null;
-    if (areasToIgnore && areasToIgnore.trim() !== '') {
-        const arr = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+    if (areasToIgnore && String(areasToIgnore).trim() !== '') {
+        const arr = String(areasToIgnore).split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
         ignoredSet = arr.length ? new Set(arr) : null;
     }
-
+    const toAreaIdNum = (v) => { const n = Number(v); return isNaN(n) ? null : n; };
     const areasToTry = data.filter(area => {
-        if (allowedSet && !allowedSet.has(area.AreaId)) return false;
-        if (ignoredSet && ignoredSet.has(area.AreaId)) return false;
+        const id = toAreaIdNum(area.AreaId);
+        if (id == null) return false;
+        if (allowedSet && !allowedSet.has(id)) return false;
+        if (ignoredSet && ignoredSet.has(id)) return false;
         return true;
     });
     if (areasToTry.length === 0) return false;
@@ -398,10 +425,8 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
                 // Loop through all seats from StartXCoord to EndXCoord
                 for (let x = interval.StartXCoord; x <= interval.EndXCoord; x++) {
 
-                    // Stop if we have already made 4 fetch requests
                     if (totalFetchCount >= 4) {
-                        console.log(`[INFO] Reached ${totalFetchCount} total fetch attempts, stopping`);
-                        return successCount > 0; // Return true if at least one success
+                        return successCount > 0;
                     }
 
                     const seatPayload = {
@@ -417,10 +442,8 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
                         ]
                     };
 
-                    console.log(`[INFO] Trying AreaId: ${area.AreaId}, Row: ${interval.YCoord}, Seat: ${x}`);
-
                     try {
-                        totalFetchCount++; // Increment fetch counter
+                        totalFetchCount++;
                         const res = await fetch(`https://www.eticketing.co.uk/${clubname}/EDP/Ism/Select${endpointType}Seat`, {
                             method: "PUT",
                             credentials: "include",
@@ -434,31 +457,21 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
                         });
 
                         if (res.status === 400) {
-                            const text = await res.text();
-                            console.log(`[400]`, text);
-
+                            await res.text();
                         } else if (res.status === 200) {
-                            const text = await res.text();
+                            await res.text();
                             successCount++;
-                            console.log(`[SUCCESS #${successCount}] AreaId ${area.AreaId}, Row ${interval.YCoord}, Seat ${x} => ${text}`);
-
-                            if (successCount >= 3) { // Keep your original 3 success condition
-                                console.log(`[INFO] Reached 3 successes, returning true`);
-                                return true;
-                            }
-
-                        } else {
-                            console.warn(`[FAIL] Status ${res.status}`);
+                            if (successCount >= 3) return true;
                         }
-
                     } catch (err) {
-                        console.error(`[ERROR] AreaId ${area.AreaId}, Row ${interval.YCoord}, Seat ${x}`, err);
+                        // silent during try loop for speed
                     }
                 }
             }
         }
     }
 
+    console.log('[CS] Direct add to basket (' + endpointType + '): ' + successCount + ' seat(s) added from ' + totalFetchCount + ' attempt(s), ' + areasToTry.length + ' area(s) tried.');
     return successCount > 0; // True if at least one success
 }
 
@@ -637,9 +650,14 @@ async function getEmailForNotification() {
 }
 
 async function checkOnce() {
-    
-
     if (!monitor.running) return;
+
+    // Pause seat checking during queue error403 wait (5 min)
+    const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
+    if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
+        console.log('[CS] error403 pause active - skipping seat check');
+        return;
+    }
 
     let matched_row = null;
     if (checksheet) {
@@ -732,10 +750,8 @@ async function checkOnce() {
 
             if (queueItErrorCount >= 1) {
                 console.warn('[CS] 1 consecutive queue-it redirects (count:', queueItErrorCount, '), refreshing...');
-
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                await refreshEventTabWithTracking();
-                queueItErrorCount = 0; // reset after refresh
+                if (await refreshEventTabWithTracking()) queueItErrorCount = 0;
                 return;
             }
         } else {
@@ -773,9 +789,8 @@ async function checkOnce() {
             if (tunnelTimeoutErrorCount >= 2) {
                 console.warn('[CS] 2 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                await refreshEventTabWithTracking();
-                tunnelTimeoutErrorCount = 0; // reset after refresh
-            return;
+                if (await refreshEventTabWithTracking()) tunnelTimeoutErrorCount = 0;
+                return;
             }
         } else {
             // reset on other errors
@@ -814,9 +829,10 @@ async function checkOnce() {
 
         if (error403Count >= 6) {
             console.warn('[CS] 6 consecutive 403 errors — refreshing tab.');
-            await refreshEventTabWithTracking();
-            justRefreshedDueTo403 = true;
-            error403Count = 0;
+            if (await refreshEventTabWithTracking()) {
+                justRefreshedDueTo403 = true;
+                error403Count = 0;
+            }
         }
 
         return;
@@ -839,8 +855,7 @@ async function checkOnce() {
             console.warn('[CS] 7 or more consecutive other errors (count:', notfound400erorsCount, ') — requesting cookie clear & refresh.');
             chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
             await delay(2000);
-            await refreshEventTabWithTracking();
-            notfound400erorsCount = 0; // reset error counter
+            if (await refreshEventTabWithTracking()) notfound400erorsCount = 0;
         }
 
         return;
@@ -849,51 +864,60 @@ async function checkOnce() {
     let data;
     try {
         data = await res.json();
-        console.log('[CS] seats response data', data);
     } catch (e) {
         console.warn('[CS] seats response JSON parse failed', e);
-        console.log('[CS] seats response text', await res.text());
         return;
     }
 
-// ✅ All error counters already reset above on 200 status
-
     if (!Array.isArray(data) || data.length === 0) {
-        console.log('[CS] Seat not found');
+        console.log('[CS] Seats API: no areas returned (seat not found).');
         return;
     }
 
     const { areaIds, areasToIgnore } = await chrome.storage.local.get(['areaIds', 'areasToIgnore']);
     let allowedSet = null;
-    if (areaIds && areaIds.trim() !== '') {
-        const arr = areaIds.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+    if (areaIds && String(areaIds).trim() !== '') {
+        const arr = String(areaIds).split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
         allowedSet = arr.length ? new Set(arr) : null;
     }
     let ignoredSet = null;
-    if (areasToIgnore && areasToIgnore.trim() !== '') {
-        const arr = areasToIgnore.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+    if (areasToIgnore && String(areasToIgnore).trim() !== '') {
+        const arr = String(areasToIgnore).split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
         ignoredSet = arr.length ? new Set(arr) : null;
     }
 
+    const toAreaIdNum = (v) => { const n = Number(v); return isNaN(n) ? null : n; };
     let area = null;
     for (let i = 0; i < data.length; i++) {
         const a = data[i];
         if (!a.PriceBands || !a.PriceBands.length) continue;
-        if (allowedSet && !allowedSet.has(a.AreaId)) continue;
-        if (ignoredSet && ignoredSet.has(a.AreaId)) continue;
+        const id = toAreaIdNum(a.AreaId);
+        if (id == null) continue;
+        if (allowedSet && !allowedSet.has(id)) continue;
+        if (ignoredSet && ignoredSet.has(id)) continue;
         area = a;
         break;
     }
     if (!area && (allowedSet || ignoredSet)) {
-        if (allowedSet) return;
-        area = data.find(a => a.PriceBands && a.PriceBands.length && (!ignoredSet || !ignoredSet.has(a.AreaId))) || data[0];
+        if (allowedSet) {
+            console.log('[CS] Skipping: no areas match areaIds filter (API returned ' + data.length + ' areas).');
+            return;
+        }
+        area = data.find(a => {
+            const id = toAreaIdNum(a.AreaId);
+            return id != null && a.PriceBands && a.PriceBands.length && (!ignoredSet || !ignoredSet.has(id));
+        }) || null;
+        if (!area) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
     }
     if (!area) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
+    if (!area) {
+        console.log('[CS] Skipping: no area with PriceBands in API response.');
+        return;
+    }
 
     const priceBand = area.PriceBands[0];
     const areaId = area.AreaId;
     const priceBandId = priceBand.PriceBandCode;
-
 
     let verificationToken = localStorage.getItem("verification_token");
     if (!verificationToken) {
@@ -936,7 +960,7 @@ async function checkOnce() {
             body: JSON.stringify(lockBody)
         });
     } catch (e) {
-        console.warn('[CS] Seats found (AreaId ' + areaId + ', PriceBand ' + priceBandId + ') but lock failed:', e.message);
+        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (' + e.message + ').');
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
@@ -947,8 +971,9 @@ async function checkOnce() {
     }
 
     if (lockRes.status === 403) {
+        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: 403, trying direct add to basket.');
         if (!(await tryDirectAddToBasketSecondapi(data, clubName, monitor.eventId, verificationToken, endpointType))) {
-            console.warn('[CS] Seats found but lock 403 and direct add to basket failed for all areas');
+            console.warn('[CS] Direct add to basket failed for all areas.');
             
             // Send webhook message about the failure
             const email = await getEmailForNotification();
@@ -964,7 +989,7 @@ async function checkOnce() {
     } else if (lockRes.status === 400 || lockRes.status === 404) {
         lockResponseHtmlText = await lockRes.text();
         lockResponseHtmlText = lockResponseHtmlText.replace(/<[^>]*>?/g, '').replace(/\n/g, '');
-        console.warn('[CS] Seats found (AreaId ' + areaId + ', PriceBand ' + priceBandId + ') but lock failed with status', lockRes.status);
+        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (status ' + lockRes.status + ').');
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
@@ -973,7 +998,7 @@ async function checkOnce() {
         });
         return;
     } else if (lockRes.status !== 200) {
-        console.warn('[CS] Seats found (AreaId ' + areaId + ') but lock failed with status', lockRes.status);
+        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (status ' + lockRes.status + ').');
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
@@ -993,9 +1018,12 @@ async function checkOnce() {
 
         const lockedSeats = lockJson?.LockedSeats;
         if (!lockedSeats || lockedSeats.length === 0) {
-            console.warn('[CS] Seats found but no LockedSeats in lock response');
+            console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: 200 but no LockedSeats in response.');
             return;
         }
+
+        const foundAreaIds = data.map(a => toAreaIdNum(a.AreaId)).filter(id => id != null);
+        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: success. Monitor: ' + (areaIds === '' || areaIds == null ? '(any)' : areaIds) + ' | ignore: ' + (areasToIgnore === '' || areasToIgnore == null ? '(none)' : areasToIgnore) + ' | API areas: ' + (foundAreaIds.length ? foundAreaIds.join(', ') : '(none)'));
 
         const priceClassId = getPriceClassIdForClub(clubName);
         let seatsToAdd;
@@ -1474,8 +1502,13 @@ async function waitForEventTabReload(timeoutMs = 140000) {
     return false;
 }
 
-// Helper function to refresh event tab with reload tracking
+// Helper function to refresh event tab with reload tracking. Returns true if refresh was sent/done, false if skipped (e.g. error403 pause).
 async function refreshEventTabWithTracking() {
+    const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
+    if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
+        console.log('[CS] error403 pause active - not sending refresh event tab.');
+        return false;
+    }
     console.log('[CS] Setting event tab reload flag to false');
     await chrome.storage.local.set({ eventTabReloaded: false });
     
@@ -1489,5 +1522,6 @@ async function refreshEventTabWithTracking() {
     });
     
     // Wait for reload completion instead of fixed time
-    return await waitForEventTabReload();
+    await waitForEventTabReload();
+    return true;
 }

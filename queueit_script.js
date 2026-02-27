@@ -43,29 +43,41 @@ function sendQueueWaitingToBackground() {
 let queueFlagEverSeen = false; // true if "people ahead" or progress bar has been visible at any time on this page
 let joinWaitingRoomButtonClicked = false; // track if "Join waiting room" button was clicked
 let confirmRedirectButtonClicked = false; // track if "Yes, please" confirm redirect button was clicked
+let getNewPlaceInQueueClicked = false; // track if "Get a new place in the queue" link was clicked
+let captchaCodeLabelHandled = false; // track if "Enter the code from the picture" label was handled
 
 if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || window.location.href.startsWith("http://hd-queue.eticketing.co.uk")) {
-    console.log("[QueueIt Script] Running on the correct page.");
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', startQueueItScript);
-    } else {
-        startQueueItScript();
-    }
-
-    // Send setQueueWaiting to background every 3s; background clears flag if no message in 10s
-    setInterval(sendQueueWaitingToBackground, 3000);
-    sendQueueWaitingToBackground(); // run once on load
-
-    // If neither "people ahead" nor progress bar appears after 120s, clear cookies and reopen event URL in same tab (do not clear if flag was ever seen)
-    setTimeout(() => {
-        if (queueFlagEverSeen) return;
-        if (hasPeopleAheadOfYouVisible()) return;
-        console.log("[QueueIt Script] No queue indicators after 120s - clearing cookies and reopening event URL in same tab");
-        chrome.runtime.sendMessage({ action: 'clearCookiesAndReopenInSameTab' }, () => {
-            if (chrome.runtime.lastError) console.error('[QueueIt Script] clearCookiesAndReopenInSameTab error:', chrome.runtime.lastError);
+    // If we're on the error403 page, notify background and do not run any queue logic (pause until background resumes after wait)
+    if (window.location.href.indexOf('error403') !== -1) {
+        console.log("[QueueIt Script] error403 page detected - pausing script and notifying background.");
+        chrome.runtime.sendMessage({ action: 'error403Detected' }, () => {
+            if (chrome.runtime.lastError) console.error('[QueueIt Script] error403Detected error:', chrome.runtime.lastError);
         });
-    }, 120000);
+        // Do not start queue checks, 120s timeout, or sendQueueWaiting
+        // Background will wait (5/7/9... min) then reopen/reload tabs same as sheet on/off
+    } else {
+        console.log("[QueueIt Script] Running on the correct page.");
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', startQueueItScript);
+        } else {
+            startQueueItScript();
+        }
+
+        // Send setQueueWaiting to background every 3s; background clears flag if no message in 10s
+        setInterval(sendQueueWaitingToBackground, 3000);
+        sendQueueWaitingToBackground(); // run once on load
+
+        // If neither "people ahead" nor progress bar appears after 120s, clear cookies and reopen event URL in same tab (do not clear if flag was ever seen)
+        setTimeout(() => {
+            if (queueFlagEverSeen) return;
+            if (hasPeopleAheadOfYouVisible()) return;
+            console.log("[QueueIt Script] No queue indicators after 120s - clearing cookies and reopening event URL in same tab");
+            chrome.runtime.sendMessage({ action: 'clearCookiesAndReopenInSameTab' }, () => {
+                if (chrome.runtime.lastError) console.error('[QueueIt Script] clearCookiesAndReopenInSameTab error:', chrome.runtime.lastError);
+            });
+        }, 120000);
+    }
 
     function startQueueItScript() {
         console.log("[QueueIt Script] Starting queue-it script...");
@@ -106,6 +118,35 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                     confirmRedirectButtonClicked = true;
                     console.log("[QueueIt Script] 'Yes, please' confirm redirect button found, clicking immediately...");
                     confirmRedirectButton.click();
+                }
+            }
+
+            // --- Click "Get a new place in the queue" link as soon as it appears ---
+            if (!getNewPlaceInQueueClicked) {
+                const getNewPlaceLink = Array.from(document.querySelectorAll('a.btn')).find(a => {
+                    const t = (a.textContent || '').trim();
+                    return t.indexOf('Get a new place in the queue') !== -1;
+                });
+                if (getNewPlaceLink) {
+                    getNewPlaceInQueueClicked = true;
+                    console.log("[QueueIt Script] 'Get a new place in the queue' link found, clicking immediately...");
+                    getNewPlaceLink.click();
+                }
+            }
+
+            // --- "Enter the code from the picture" label: wait 4s, refresh event tab, close this tab ---
+            if (!captchaCodeLabelHandled) {
+                const captchaCodeLabel = document.querySelector('label#captcha-code-label[for="CaptchaCode"]');
+                const hasLabelText = captchaCodeLabel && (captchaCodeLabel.textContent || '').trim().indexOf('Enter the code from the picture') !== -1;
+                if (hasLabelText) {
+                    captchaCodeLabelHandled = true;
+                    clearInterval(checkElements);
+                    console.log("[QueueIt Script] 'Enter the code from the picture' label found - waiting 4s then refreshing event tab and closing this tab.");
+                    setTimeout(() => {
+                        chrome.runtime.sendMessage({ action: 'refreshEventTabAndCloseQueueTab' }, response => {
+                            if (chrome.runtime.lastError) console.error('[QueueIt Script] refreshEventTabAndCloseQueueTab error:', chrome.runtime.lastError);
+                        });
+                    }, 4000);
                 }
             }
 
