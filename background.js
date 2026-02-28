@@ -33,6 +33,7 @@ setInterval(() => { checkQueueWaitingTimeout(); }, QUEUE_WAITING_CHECK_INTERVAL_
 // Alarms keep the service worker from going idle and drive sheet polling
 const POLL_SHEET_ALARM = 'pollSheet';
 const KEEP_ALIVE_ALARM = 'keepAlive';
+const CHECK_EVENT_TAB_ALARM = 'checkEventTab';
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === POLL_SHEET_ALARM) {
@@ -44,6 +45,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             });
     } else if (alarm.name === KEEP_ALIVE_ALARM) {
         checkQueueWaitingTimeout();
+    } else if (alarm.name === CHECK_EVENT_TAB_ALARM) {
+        checkEventTabAndCreateIfMissing()
+            .catch(e => console.warn('[BG] checkEventTabAndCreateIfMissing error:', e));
     }
 });
 
@@ -56,6 +60,7 @@ function startPolling() {
 function stopPolling() {
     chrome.alarms.clear(POLL_SHEET_ALARM);
     chrome.alarms.clear(KEEP_ALIVE_ALARM);
+    chrome.alarms.clear(CHECK_EVENT_TAB_ALARM);
     pollIntervalId = null;
     console.log('[BG] Polling stopped');
 }
@@ -209,9 +214,11 @@ function ensurePolling() {
         pollIntervalId = true; // mark polling active
         // Keep-alive alarm: fire every 1 minute so service worker doesn't go idle
         chrome.alarms.create(KEEP_ALIVE_ALARM, { periodInMinutes: 1 });
+        // Every 2 minutes: ensure event tab exists when sheet status is on (create via refreshEventTab if missing)
+        chrome.alarms.create(CHECK_EVENT_TAB_ALARM, { periodInMinutes: 2 });
         scheduleNextPoll();
         pollSheetAndControl(); // run immediately
-        console.log('[BG] ensurePolling: Polling started with alarms (sheet + keepAlive)');
+        console.log('[BG] ensurePolling: Polling started with alarms (sheet + keepAlive + checkEventTab 2min)');
     } else {
         console.log('[BG] ensurePolling: Polling already running');
     }
@@ -950,6 +957,23 @@ async function notifyValidationTabError403Resume() {
         chrome.tabs.sendMessage(tab.id, { action: 'error403Resume' }).catch(() => {});
     }
     if (validationTabs.length) console.log('[BG] Sent error403Resume to', validationTabs.length, 'validation tab(s)');
+}
+
+/** Runs every 2 min (alarm). If sheet status is on and event tab is missing, creates it via refreshEventTab. */
+async function checkEventTabAndCreateIfMissing() {
+    if (lastStatus !== 'on') return;
+    if (Date.now() < error403PauseUntil) return;
+    const { eventUrl, inQueueWaiting } = await chrome.storage.local.get(['eventUrl', 'inQueueWaiting']);
+    if (!eventUrl) return;
+    if (inQueueWaiting) return;
+
+    const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
+    const eventTabExists = tabs.some(t => t.url && t.url.startsWith(eventUrl));
+    if (eventTabExists) return; // tab open, no action
+
+    EVENT_URL = eventUrl;
+    console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
+    await refreshEventTab();
 }
 
 async function refreshEventTab() {

@@ -264,12 +264,24 @@ async function scheduleNextCheck() {
         lastScheduledTime += waitMs;
     }
 
-    // delay = lastScheduledTime - now automatically compensates for API response time:
-    // now ≈ (last run start) + responseTime, so delay = 12s - responseTime → next call starts 12s after previous start
+    // delay = lastScheduledTime - now (compensates for response time when we're on time)
     let delay = lastScheduledTime - now;
-    // if delay is less than 7 seconds , increment it with waitMs
-    if (delay < 7000) {
+
+    // If we're behind (API took too long), schedule at the next 12s boundary so we never fire in the past
+    if (delay <= 0) {
+        const dateNow = new Date();
+        const curSec = dateNow.getSeconds();
+        const base = monitor.startSecond ?? 0;
+        const K = Math.floor(waitMs / 1000);
+        let deltaSec = (base - curSec) % K;
+        if (deltaSec <= 0) deltaSec += K;
+        const alignMs = deltaSec * 1000 - dateNow.getMilliseconds();
+        lastScheduledTime = now + alignMs;
+        delay = alignMs;
+    } else if (delay < 7000) {
+        // Slightly behind but positive: push to next full 12s interval
         delay += waitMs;
+        lastScheduledTime = now + delay;
     }
 
     const nextCallAt = new Date(now + delay);
