@@ -4,6 +4,7 @@ let EVENT_URL = "";
 
 let eventTabId = null;
 let notAllowedTabId = null;
+let openOrFocusTabsInProgress = false; // prevents 2-min check from creating a second event tab while heartbeat reload runs
 
 console.log('[BG] Background loaded');
 let lastStatus = null;
@@ -92,18 +93,18 @@ async function pollSheetAndControl() {
         const data = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
         if (!data.sheetUrl) return;
 
-        const targetStartSecond = parseInt(data.startSecond ?? -2, 10);
-
+        const targetStartSecond = parseFloat(data.startSecond);
+        const targetNum = Number.isNaN(targetStartSecond) ? -2 : targetStartSecond;
 
         const gvizUrl = getGvizUrl(data.sheetUrl);
         if (!gvizUrl) return; // invalid URL, stop execution
 
         const allCfg = await fetchSheetConfigAll(gvizUrl);
 
-        // Find rows that are ON and match startSecond
+        // Find rows that are ON and match startSecond (supports decimals, e.g. 2.5)
         const matchingRows = allCfg.filter(cfg =>
             ['on', 'start', 'true', '1'].includes((cfg.status || '').toString().trim().toLowerCase()) &&
-            parseInt(cfg.startSecond, 10) === targetStartSecond
+            parseFloat(cfg.startSecond) === targetNum
         );
 
         const anyMatch = matchingRows.length > 0;
@@ -373,7 +374,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 isFirstHeartbeat = true;
                 console.log('[BG] error403 resuming at', resumingAt.toLocaleTimeString());
                 const { sheetUrl, startSecond, eventUrl } = await chrome.storage.local.get(['sheetUrl', 'startSecond', 'eventUrl']);
-                const targetStartSecond = parseInt(startSecond ?? -2, 10);
+                const targetNum = Number.isNaN(parseFloat(startSecond)) ? -2 : parseFloat(startSecond);
                 let sheetStatusOn = false;
                 if (sheetUrl) {
                     try {
@@ -382,7 +383,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                             const allCfg = await fetchSheetConfigAll(sheetUrl);
                             const matchingRows = allCfg.filter(cfg =>
                                 ['on', 'start', 'true', '1'].includes((cfg.status || '').toString().trim().toLowerCase()) &&
-                                parseInt(cfg.startSecond, 10) === targetStartSecond
+                                parseFloat(cfg.startSecond) === targetNum
                             );
                             sheetStatusOn = matchingRows.length > 0;
                         }
@@ -566,10 +567,11 @@ async function refreshCredentialsFromSheet() {
 
     console.log('[BG] Checking all rows for startSecond match:', startSecond);
 
-    // Find matching rows that are active
+    // Find matching rows that are active (startSecond can be decimal, e.g. 2.5)
+    const targetNum = parseFloat(startSecond);
     const matchingRows = allCfg.filter(cfg =>
         ['on', 'start', 'true', '1'].includes((cfg.status || '').toString().trim().toLowerCase()) &&
-        parseInt(cfg.startSecond, 10) === parseInt(startSecond, 10)
+        parseFloat(cfg.startSecond) === targetNum
     );
 
     if (matchingRows.length === 0) {
@@ -609,8 +611,9 @@ async function startFlowFromStorage() {
 
     console.log('[BG] Checking all rows for startSecond match:', startSecond);
 
+    const targetNum = parseFloat(startSecond);
     for (const cfg of allCfg) {
-        if (parseInt(cfg.startSecond, 10) === parseInt(startSecond, 10)) {
+        if (parseFloat(cfg.startSecond) === targetNum) {
             console.log('[BG] Found matching row for startSecond:', startSecond, cfg);
             // {
             //     "status": "on",
@@ -645,17 +648,18 @@ async function startFlowFromStorage() {
 }
 
 async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
+    if (Date.now() < error403PauseUntil) {
+        console.log('[BG] error403 pause active - skipping openOrFocusTabs.');
+        return;
+    }
+    await checkQueueWaitingTimeout();
+    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+    if (inQueueWaiting) {
+        console.log('[BG] inQueueWaiting is set - user is in queue (people ahead of you). Skipping openOrFocusTabs (no closing/creating tabs).');
+        return;
+    }
+    openOrFocusTabsInProgress = true;
     try {
-        if (Date.now() < error403PauseUntil) {
-            console.log('[BG] error403 pause active - skipping openOrFocusTabs.');
-            return;
-        }
-        await checkQueueWaitingTimeout();
-        const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
-        if (inQueueWaiting) {
-            console.log('[BG] inQueueWaiting is set - user is in queue (people ahead of you). Skipping openOrFocusTabs (no closing/creating tabs).');
-            return;
-        }
         const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
 
         console.log("event url:", eventUrl);
@@ -866,6 +870,8 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
     } catch (e) {
         console.error('[BG] openOrFocusTabs error', e);
+    } finally {
+        openOrFocusTabsInProgress = false;
     }
 }
 
@@ -895,58 +901,65 @@ function waitForTabLoad(tabId, timeout = 15000) {
     });
 }
 
+// Hosts we manage: only event tab + validation tab allowed; everything else from these hosts gets closed (except checkout)
+const ETICKETING_HOST = 'www.eticketing.co.uk';
+const QUEUE_HOST = 'hd-queue.eticketing.co.uk';
+const ARSENAL_HOST = 'www.arsenal.com';
+
+function tabUrlIsManagedHost(url) {
+    if (!url) return false;
+    try {
+        const u = new URL(url);
+        const host = u.hostname.toLowerCase();
+        return host === ETICKETING_HOST || host === QUEUE_HOST || host === ARSENAL_HOST;
+    } catch (_) {
+        return false;
+    }
+}
+
+function tabIsCheckout(url) {
+    return url && url.toLowerCase().includes('checkout');
+}
+
+/** Keep only 1 event tab + 1 validation tab. Close other eticketing and arsenal.com tabs. Never close queue tabs or checkout. */
 async function closeOtherEticketingTabs() {
-    const allowedUrls = [
-        ...(EVENT_URL ? [EVENT_URL] : []),
-        EVENT_NOT_ALLOWED_URL
-    ];
-    // console.log('[BG] closeOtherEticketingTabs, allowed:', allowedUrls);
-    const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
+    const eventUrl = EVENT_URL || '';
+    const validationUrl = EVENT_NOT_ALLOWED_URL || '';
+
+    const tabs = await chrome.tabs.query({});
+    let keptEventId = null;
+    let keptValidationId = null;
+    const toClose = [];
+
     for (const t of tabs) {
-        // Skip closing tabs that have "checkout" in the URL
-        if (t.url && t.url.toLowerCase().includes('checkout')) {
-            console.log('[BG] Skipping checkout tab:', t.id, t.url);
-            continue;
-        }
-        
-        if (!allowedUrls.some(u => t.url && t.url.startsWith(u))) {
-            try {
-                await chrome.tabs.remove(t.id);
-                console.log('[BG] closed tab', t.id, t.url);
-            } catch (e) {
-                console.warn('[BG] close tab error', e);
-            }
+        const url = t.url || '';
+        if (!tabUrlIsManagedHost(url)) continue; // not our business
+        if (tabIsCheckout(url)) continue;
+        if (url.includes(QUEUE_HOST)) continue; // never close queue tabs
+
+        const isEventTab = eventUrl && url.startsWith(eventUrl);
+        const isValidationTab = validationUrl && url.startsWith(validationUrl);
+
+        if (isEventTab) {
+            if (keptEventId == null) keptEventId = t.id;
+            else toClose.push(t.id); // duplicate event tab
+        } else if (isValidationTab) {
+            if (keptValidationId == null) keptValidationId = t.id;
+            else toClose.push(t.id); // duplicate validation tab
         } else {
-            // console.log('[BG] keep tab', t.id, t.url);
+            // other eticketing or arsenal tab
+            toClose.push(t.id);
         }
     }
 
-    // Close all tabs whose URL starts with hd-queue.eticketing.co.uk (unless user is in queue waiting)
-    chrome.storage.local.get('inQueueWaiting').then(({ inQueueWaiting }) => {
-        if (inQueueWaiting) {
-            console.log('[BG] inQueueWaiting is set - not closing queue tab(s).');
-            return;
+    for (const id of toClose) {
+        try {
+            await chrome.tabs.remove(id);
+            console.log('[BG] Closed unnecessary tab:', id);
+        } catch (e) {
+            console.warn('[BG] close tab error', id, e);
         }
-        chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-                if (tab.url && tab.url.toLowerCase().includes('checkout')) {
-                    console.log('[BG] Skipping checkout tab:', tab.id, tab.url);
-                    return;
-                }
-                if (tab.url && (tab.url.startsWith('https://hd-queue.eticketing.co.uk/') || tab.url.startsWith('http://hd-queue.eticketing.co.uk/'))) {
-                    chrome.tabs.remove(tab.id, () => {
-                        if (chrome.runtime.lastError) {
-                            console.warn('Failed to close tab:', tab.id, chrome.runtime.lastError);
-                        } else {
-                            console.log('Closed tab:', tab.id, tab.url);
-                        }
-                    });
-                }
-            });
-        });
-    });
-
-
+    }
 }
 
 /** Notify validation (EventNotAllowed) tabs that error403 pause ended so they resume seat checks instantly. */
@@ -959,21 +972,23 @@ async function notifyValidationTabError403Resume() {
     if (validationTabs.length) console.log('[BG] Sent error403Resume to', validationTabs.length, 'validation tab(s)');
 }
 
-/** Runs every 2 min (alarm). If sheet status is on and event tab is missing, creates it via refreshEventTab. */
+/** Runs every 2 min (alarm). If sheet status is on: ensure event tab exists; close any unnecessary tabs (only event + validation allowed). */
 async function checkEventTabAndCreateIfMissing() {
     if (lastStatus !== 'on') return;
     if (Date.now() < error403PauseUntil) return;
+    if (openOrFocusTabsInProgress) return; // avoid creating second event tab while heartbeat reload (openOrFocusTabs) is running
     const { eventUrl, inQueueWaiting } = await chrome.storage.local.get(['eventUrl', 'inQueueWaiting']);
     if (!eventUrl) return;
     if (inQueueWaiting) return;
 
     const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
     const eventTabExists = tabs.some(t => t.url && t.url.startsWith(eventUrl));
-    if (eventTabExists) return; // tab open, no action
-
-    EVENT_URL = eventUrl;
-    console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
-    await refreshEventTab();
+    if (!eventTabExists) {
+        EVENT_URL = eventUrl;
+        console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
+        await refreshEventTab();
+    }
+    await closeOtherEticketingTabs();
 }
 
 async function refreshEventTab() {
@@ -1078,7 +1093,7 @@ async function fetchSheetConfigAll(sheetUrl) {
             eventUrl: map['eventurl'] || '',
             areSeatsTogether: String(map['areseatstogether']).toLowerCase() === 'true',
             quantity: parseInt(map['quantity'] || '1', 10),
-            startSecond: parseInt(map['startsecond'] || '1', 10),
+            startSecond: (() => { const v = parseFloat(map['startsecond']); return Number.isNaN(v) ? 1 : v; })(),
             eventId: map['eventid'] || '',
             maximumPrice: map['maximumprice'] || '',
             minimumPrice: map['minimumprice'] || '',

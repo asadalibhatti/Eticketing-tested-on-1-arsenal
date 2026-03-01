@@ -19,13 +19,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     await chrome.storage.local.set({ sheetUrl: DEFAULT_SHEET_URL });
   }
   
-  if (typeof startSecond === 'number') startSecondInput.value = startSecond;
+  if (startSecond != null && startSecond !== '') startSecondInput.value = String(startSecond).replace(',', '.');
 });
 
 startBtn.addEventListener('click', async () => {
   const sheetUrl = sheetUrlInput.value.trim();
-  const startSecond = parseInt(startSecondInput.value || '0', 10);
+  const raw = (startSecondInput.value.trim() || '2').replace(',', '.');
+  const startSecond = parseFloat(raw);
   if (!sheetUrl) return alert('Enter sheet URL');
+  if (Number.isNaN(startSecond)) return alert('Start Second must be a number (e.g. 2 or 2.5)');
 
   await chrome.storage.local.set({ sheetUrl, startSecond, manualStart: true });
   chrome.runtime.sendMessage({ action: 'manualStart' });

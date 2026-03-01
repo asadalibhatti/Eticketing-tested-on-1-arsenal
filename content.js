@@ -145,7 +145,7 @@ async function startMonitorFlow() {
             const row = await getMatchingRowFromSheet(monitor.sheetUrl, monitor.startSecond);
             if (row) {
                 monitor.eventUrl = row.EventUrl;
-                monitor.startSecond = parseInt(row.StartSecond, 10) || monitor.startSecond;
+                monitor.startSecond = parseFloat(row.StartSecond) ?? monitor.startSecond;
                 monitor.areSeatsTogether = row.AreSeatsTogether === true || ('' + row.AreSeatsTogether).toLowerCase() === 'true';
                 monitor.quantity = parseInt(row.Quantity || '1', 10);
                 
@@ -198,9 +198,36 @@ let lastScheduledTime = null; // stores the planned next run time
 let lastRealignTime = null;   // stores the timestamp of the last realignment
 let lastRunStartTime = null; // when runCheck() last started (used to log response time)
 
+/** Format date as HH:mm:ss.SSS for logs so 80.5 vs 80 are distinguishable. */
+function formatTimeWithMs(date) {
+    const d = new Date(date);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const s = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${h}:${m}:${s}.${ms}`;
+}
+
+/**
+ * Generic formula: next API call = next time (clock seconds) matches extension number in the 12s cycle.
+ * - Extension 1  → refresh at :01, :13, :25, :37, :49 (seconds)
+ * - Extension 1.5 → refresh at :01.5, :13.5, :25.5, ...
+ * - Extension 2  → refresh at :02, :14, :26, ...
+ * Formula: (clock sec + ms/1000) % 12 === extensionNumber % 12. Returns ms until that moment.
+ */
+function getAlignMsToNextInterval(dateNow, startSecondVal, intervalMs) {
+    const baseSec = parseFloat(startSecondVal);
+    if (Number.isNaN(baseSec)) return intervalMs;
+    const baseOffsetMs = ((baseSec * 1000) % intervalMs + intervalMs) % intervalMs;
+    const curMsInCycle = (dateNow.getSeconds() * 1000 + dateNow.getMilliseconds()) % intervalMs;
+    let alignMs = (baseOffsetMs - curMsInCycle + intervalMs) % intervalMs;
+    if (alignMs <= 0) alignMs = intervalMs;
+    return alignMs;
+}
+
 async function scheduleNextCheck() {
-    const waitMs = 12000; // exactly 12 seconds between each API call (realign every 2 min keeps drift small)
-    const realignIntervalMs = 120000; // 2 minutes for realignment
+    const waitMs = 12000; // 12s cycle: extension N refreshes when clock (sec % 12) === N (e.g. ext 1 at :01/:13/:25, ext 1.5 at :01.5/:13.5)
+    const realignIntervalMs = 120000; // 2 min log only; schedule is always from clock
 
     // During error403 pause, poll every 5s so we resume quickly when flag clears
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
@@ -215,81 +242,29 @@ async function scheduleNextCheck() {
 
     const now = Date.now();
 
-    if (!lastScheduledTime) {
-        // First run: align with monitor.startSecond
-        const dateNow = new Date();
-        const curSec = dateNow.getSeconds();
-        const base = monitor.startSecond ?? 0;
+    const base = monitor.startSecond ?? 0;
+    const dateNow = new Date();
+    // Single formula: next API call = next time clock (sec % 12) matches extension number
+    const alignMs = getAlignMsToNextInterval(dateNow, base, waitMs);
+    const delay = alignMs;
+    lastScheduledTime = now + delay;
+    if (!lastRealignTime) lastRealignTime = now;
 
-        let deltaSec = (base - curSec) % Math.floor(waitMs / 1000);
-        if (deltaSec <= 0) deltaSec += Math.floor(waitMs / 1000);
-
-        const alignMs = deltaSec * 1000 - dateNow.getMilliseconds();
-        lastScheduledTime = now + alignMs;
-        lastRealignTime = now;
-
-        const nextRun = new Date(lastScheduledTime);
-        console.log('[CS] Next seat API call in ' + (alignMs / 1000).toFixed(1) + 's at ' + nextRun.toLocaleTimeString() + ' (first check aligned to startSecond=' + base + ')');
-
-        setTimeout(runCheck, alignMs);
-        return;
-    }
-
-    // Check if it's time to realign
+    // Log realignment every 2 min (informational only; schedule is always from clock)
     if (now - lastRealignTime >= realignIntervalMs) {
-        // Realign lastScheduledTime to current time + alignment to startSecond
-
-        const dateNow = new Date();
-        const curSec = dateNow.getSeconds();
-        const base = monitor.startSecond ?? 0;
-
-        let deltaSec = (base - curSec) % Math.floor(waitMs / 1000);
-        if (deltaSec <= 0) deltaSec += Math.floor(waitMs / 1000);
-
-        const alignMs = deltaSec * 1000 - dateNow.getMilliseconds();
-        const newScheduledTime = now + alignMs;
-
-        // Calculate how much adjustment we are making
-        const adjustmentMs = newScheduledTime - lastScheduledTime;
-
-        console.log(`[CS] Realigning schedule after 2 minutes.`);
-        console.log(`[CS] Previous lastScheduledTime: ${new Date(lastScheduledTime).toLocaleTimeString()}`);
-        // console.log(`[CS] New lastScheduledTime:      ${new Date(newScheduledTime).toLocaleTimeString()}`);
-        console.log(`[CS] Adjustment applied:        ${adjustmentMs} ms (${(adjustmentMs / 1000).toFixed(2)} seconds)`);
-
-        lastScheduledTime = newScheduledTime;
+        console.log(`[CS] Realigning (2 min): next call still bound to extension ${base} at :${(base % 12).toFixed(1)}s in each 12s cycle`);
         lastRealignTime = now;
-    } else {
-        // Normal increment by waitMs (next run is 12s after *scheduled* start of last run)
-        lastScheduledTime += waitMs;
     }
 
-    // delay = lastScheduledTime - now (compensates for response time when we're on time)
-    let delay = lastScheduledTime - now;
-
-    // If we're behind (API took too long), schedule at the next 12s boundary so we never fire in the past
-    if (delay <= 0) {
-        const dateNow = new Date();
-        const curSec = dateNow.getSeconds();
-        const base = monitor.startSecond ?? 0;
-        const K = Math.floor(waitMs / 1000);
-        let deltaSec = (base - curSec) % K;
-        if (deltaSec <= 0) deltaSec += K;
-        const alignMs = deltaSec * 1000 - dateNow.getMilliseconds();
-        lastScheduledTime = now + alignMs;
-        delay = alignMs;
-    } else if (delay < 7000) {
-        // Slightly behind but positive: push to next full 12s interval
-        delay += waitMs;
-        lastScheduledTime = now + delay;
-    }
-
+    const responseTimeMs = typeof lastRunStartTime === 'number' ? now - lastRunStartTime : 0;
     const nextCallAt = new Date(now + delay);
-    const responseTimeMs = typeof lastRunStartTime === 'number' ? now - lastRunStartTime : null;
-    if (responseTimeMs != null) {
-        console.log('[CS] API+processing took ' + (responseTimeMs / 1000).toFixed(2) + 's, next seat API call in ' + (delay / 1000).toFixed(1) + 's at ' + nextCallAt.toLocaleTimeString());
+    const delaySec = (delay / 1000).toFixed(2);
+    const timeStr = formatTimeWithMs(nextCallAt);
+    const baseStr = monitor.startSecond != null ? ' startSecond=' + monitor.startSecond : '';
+    if (typeof lastRunStartTime === 'number') {
+        console.log('[CS] API+processing took ' + (responseTimeMs / 1000).toFixed(2) + 's, next seat API call in ' + delaySec + 's at ' + timeStr + baseStr);
     } else {
-        console.log('[CS] Next seat API call in ' + (delay / 1000).toFixed(1) + 's at ' + nextCallAt.toLocaleTimeString());
+        console.log('[CS] Next seat API call in ' + delaySec + 's at ' + timeStr + baseStr);
     }
     chrome.runtime.sendMessage({type: "heartbeat"});
     setTimeout(runCheck, delay);
@@ -359,20 +334,20 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
                 rowData[h] = values[i];
             });
 
-            // Check match
+            // Check match (startSecond can be decimal, e.g. 2.5; compare as float)
             const status = (rowData.Status || '').toString().trim().toLowerCase();
-            const sheetSecond = parseInt(rowData.StartSecond, 10);
-            if (sheetSecond === startSecond) {
-                // console.log('[CS] found matching row for startSecond', startSecond, 'with status', status);
+            const sheetSecond = parseFloat(rowData.StartSecond);
+            const matchSecond = Number.isNaN(sheetSecond) ? null : sheetSecond;
+            const configSecond = parseFloat(startSecond);
+            const match = (matchSecond != null && !Number.isNaN(configSecond) && matchSecond === configSecond);
+            if (match) {
                 if (['off', '0', 'false', 'stop'].includes(status)) {
                     console.log('[CS] found matching row but status is Off, will not monitor');
                     rowMatchedButOff = true;
                     continue; // skip this row
                 }
-
-
             }
-            if (status === 'on' && sheetSecond === startSecond) {
+            if (status === 'on' && match) {
                 // console.log('[CS] Found matching row data:', rowData);
                 return rowData; // Found matching row
             }
