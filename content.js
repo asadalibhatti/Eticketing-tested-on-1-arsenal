@@ -262,6 +262,12 @@ async function scheduleNextCheck() {
         lastEventTabRefreshAt = 0;
         minDelayAfterEventTabRefreshMs = 15000; // reset to default for next refresh
     }
+    // If the next call would happen too soon (<7s), skip to the next 12s cycle so we don't hammer the API,
+    // while still keeping alignment to the 12s clock.
+    const minGapMs = 7000;
+    while (delay < minGapMs) {
+        delay += waitMs;
+    }
     lastScheduledTime = now + delay;
     if (!lastRealignTime) lastRealignTime = now;
 
@@ -833,10 +839,17 @@ async function checkOnce() {
         error403Count++;
         console.warn('[CS] received 403 Forbidden error from check seats availability API, count:', error403Count);
 
+        // At 3 consecutive 403s: pause 90s, then resume on normal schedule; do not reset counter
+        if (error403Count === 3) {
+            console.warn('[CS] 3 consecutive 403 errors — pausing 90s before next seat API call.');
+            await delay(90000);
+            return;
+        }
+
         if (error403Count >= 6) {
-            if (refreshDueTo403Count >= 1) {
-                // Second time we're refreshing due to 403 -> clear cookies and refresh, then reset counter
-                console.warn('[CS] 6 consecutive 403 errors again — clearing cookies and refreshing.');
+            if (refreshDueTo403Count >= 2) {
+                // Third time we're refreshing due to 403 -> clear cookies and refresh, then reset counter
+                console.warn('[CS] 6 consecutive 403 errors (3rd time) — clearing cookies and refreshing.');
                 refreshDueTo403Count = 0;
                 error403Count = 0;
                 chrome.runtime.sendMessage({ action: 'clearCookiesAndRefresh' });
@@ -847,11 +860,11 @@ async function checkOnce() {
                     await delay(60000);
                 }
             } else {
-                // First time: refresh tab only
+                // First or second time: refresh tab only
                 console.warn('[CS] 6 consecutive 403 errors — refreshing tab.');
                 const refreshed = await refreshEventTabWithTracking();
                 if (refreshed) {
-                    refreshDueTo403Count = 1;
+                    refreshDueTo403Count = (refreshDueTo403Count || 0) + 1;
                     error403Count = 0;
                 } else {
                     error403Count = 0; // reset so we don't burst when pause ends
