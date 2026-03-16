@@ -2,7 +2,7 @@
 
 console.log("[QueueIt Script] Script loaded on:", window.location.href);
 
-/** Returns true if the page shows "people ahead of you" or progress bar (user is in queue and must wait). */
+/** Returns true if the page shows \"people ahead of you\", the main queue progress bar, or the \"Your queue position will be updated in:\" warning box (user is in queue and must wait). */
 function hasPeopleAheadOfYouVisible() {
     // Check for "people ahead of you" text
     const peopleAheadEl = document.querySelector('#MainPart_lbUsersInLineAheadOfYouText');
@@ -22,6 +22,18 @@ function hasPeopleAheadOfYouVisible() {
         const style = window.getComputedStyle(progressBar);
         if (style.display !== 'none' && style.visibility !== 'hidden' && progressBar.offsetParent !== null) {
             return true;
+        }
+    }
+
+    // Check for \"Your queue position will be updated in:\" warning box (same waiting state)
+    const warningBoxTextEl = document.querySelector('.warning-box p.extrabeforeElement');
+    if (warningBoxTextEl) {
+        const text = (warningBoxTextEl.textContent || '').trim().toLowerCase();
+        if (text.indexOf('your queue position will be updated in') !== -1) {
+            const style = window.getComputedStyle(warningBoxTextEl);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && warningBoxTextEl.offsetParent !== null) {
+                return true;
+            }
         }
     }
     
@@ -45,6 +57,7 @@ let joinWaitingRoomButtonClicked = false; // track if "Join waiting room" button
 let confirmRedirectButtonClicked = false; // track if "Yes, please" confirm redirect button was clicked
 let getNewPlaceInQueueClicked = false; // track if "Get a new place in the queue" link was clicked
 let captchaCodeLabelHandled = false; // track if "Enter the code from the picture" label was handled
+let browsingPausedUntil = 0; // when \"Your browsing activity has been paused\" was seen; back off actions for 60s
 
 if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || window.location.href.startsWith("http://hd-queue.eticketing.co.uk")) {
     // If we're on the error403 page, notify background and do not run any queue logic (pause until background resumes after wait)
@@ -97,6 +110,21 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 console.log("[QueueIt Script] Stopping checks after max attempts");
                 clearInterval(checkElements);
                 return;
+            }
+
+            // If Chrome/page shows "Your browsing activity has been paused", back off for 60s before taking any queue actions
+            try {
+                const bodyText = (document.body && document.body.innerText) || '';
+                if (bodyText.toLowerCase().includes('your browsing activity has been paused')) {
+                    const now = Date.now();
+                    if (now >= browsingPausedUntil) {
+                        browsingPausedUntil = now + 60000; // 60 seconds
+                        console.log("[QueueIt Script] 'Your browsing activity has been paused' detected - backing off actions for 60 seconds");
+                    }
+                }
+            } catch (_) {}
+            if (Date.now() < browsingPausedUntil) {
+                return; // skip this iteration; do nothing while paused
             }
 
             // --- Click "Join waiting room" button as soon as it appears ---

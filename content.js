@@ -197,6 +197,8 @@ async function startMonitorFlow() {
 let lastScheduledTime = null; // stores the planned next run time
 let lastRealignTime = null;   // stores the timestamp of the last realignment
 let lastRunStartTime = null; // when runCheck() last started (used to log response time)
+let nextCheckTimeoutId = null; // single scheduled timeout; clear before setting new one to avoid duplicate API calls per cycle
+let runCheckInProgress = false; // guard so only one runCheck (and thus one API call) runs at a time
 
 /** Format date as HH:mm:ss.SSS for logs so 80.5 vs 80 are distinguishable. */
 function formatTimeWithMs(date) {
@@ -232,21 +234,34 @@ async function scheduleNextCheck() {
     // During error403 pause, poll every 5s so we resume quickly when flag clears
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
     if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
-        const pauseDelay = 5000;
-        const nextAt = new Date(Date.now() + pauseDelay);
-        console.log('[CS] Next seat API call in 5s at ' + nextAt.toLocaleTimeString() + ' (error403 pause, will retry when pause ends)');
+        if (!pauseActiveLogged) {
+            console.log('[CS] error403 pause is active — seat checks and event tab refresh paused until it ends.');
+            pauseActiveLogged = true;
+        }
         chrome.runtime.sendMessage({ type: 'heartbeat' }).catch(() => {});
-        setTimeout(runCheck, pauseDelay);
+        if (nextCheckTimeoutId != null) clearTimeout(nextCheckTimeoutId);
+        nextCheckTimeoutId = setTimeout(() => { nextCheckTimeoutId = null; runCheck(); }, 5000);
         return;
     }
+    pauseActiveLogged = false; // pause ended or not active; allow one-time log next time pause is active
 
     const now = Date.now();
 
     const base = monitor.startSecond ?? 0;
     const dateNow = new Date();
     // Single formula: next API call = next time clock (sec % 12) matches extension number
-    const alignMs = getAlignMsToNextInterval(dateNow, base, waitMs);
-    const delay = alignMs;
+    let delay = getAlignMsToNextInterval(dateNow, base, waitMs);
+    // After an event tab refresh, wait at least minDelayAfterEventTabRefreshMs before next API call (15s default; 60s after tunnel/timeout refresh)
+    if (lastEventTabRefreshAt > 0) {
+        const minDelayAfterRefresh = minDelayAfterEventTabRefreshMs;
+        const elapsedSinceRefresh = now - lastEventTabRefreshAt;
+        if (elapsedSinceRefresh < minDelayAfterRefresh) {
+            const extraWait = minDelayAfterRefresh - elapsedSinceRefresh;
+            delay = Math.max(delay, extraWait);
+        }
+        lastEventTabRefreshAt = 0;
+        minDelayAfterEventTabRefreshMs = 15000; // reset to default for next refresh
+    }
     lastScheduledTime = now + delay;
     if (!lastRealignTime) lastRealignTime = now;
 
@@ -267,13 +282,20 @@ async function scheduleNextCheck() {
         console.log('[CS] Next seat API call in ' + delaySec + 's at ' + timeStr + baseStr);
     }
     chrome.runtime.sendMessage({type: "heartbeat"});
-    setTimeout(runCheck, delay);
+    if (nextCheckTimeoutId != null) clearTimeout(nextCheckTimeoutId);
+    nextCheckTimeoutId = setTimeout(() => { nextCheckTimeoutId = null; runCheck(); }, delay);
 }
 
 async function runCheck() {
-    lastRunStartTime = Date.now();
-    await checkOnce().catch(e => console.error('[CS] checkOnce err', e));
-    if (monitor.running) scheduleNextCheck();
+    if (runCheckInProgress) return; // prevent duplicate API calls when two timeouts or resume fire close together
+    runCheckInProgress = true;
+    try {
+        lastRunStartTime = Date.now();
+        await checkOnce().catch(e => console.error('[CS] checkOnce err', e));
+        if (monitor.running) scheduleNextCheck();
+    } finally {
+        runCheckInProgress = false;
+    }
 }
 
 
@@ -370,10 +392,13 @@ let checksheet = true;//read sheet one time and not next and so on
 
 // Separate error counters for different error types
 let error403Count = 0;           // For 403 Forbidden errors
-let justRefreshedDueTo403 = false; // true after a refresh due to 403; next 403 triggers clear cookies + refresh
+let refreshDueTo403Count = 0;   // number of times we've done "refresh tab" due to 403; clear cookies only when this is the second such refresh
+let lastEventTabRefreshAt = 0;  // timestamp when event tab refresh completed; next API call delayed after this
+let minDelayAfterEventTabRefreshMs = 15000; // 15s default; set to 60000 before tunnel/timeout refresh so next API waits 60s
 let tunnelTimeoutErrorCount = 0; // For tunnel connection and timeout errors
 let corsErrorCount = 0;          // For CORS errors
 let notfound400erorsCount = 0;   // For other HTTP errors (400, 401, 402, 302, 500)
+let pauseActiveLogged = false;   // one-time log when error403 pause is active; reset when pause ends to avoid log spam
 
 async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificationToken, endpointType = 'Regular') {
     let successCount = 0;       // Track successful adds
@@ -566,69 +591,60 @@ function shouldSendNotificationBasedOnSeats(basketData) {
     return { shouldSend, pairs, pairCount };
 }
 
-// Helper function to get email for notifications
+// Helper function to get email for notifications (prefer sheet-backed loginEmail so Discord shows current account after sheet update)
 async function getEmailForNotification() {
     try {
         console.log('[CS] Getting email for notification...');
-        
-        // Method 1: Try to get from localStorage
         const EMAIL_KEY = "user_email";
-        const userEmail = localStorage.getItem(EMAIL_KEY);
-        if (userEmail && userEmail.trim()) {
-            console.log('[CS] Email found in localStorage:', userEmail.substring(0, 5) + '...');
-            return userEmail;
-        }
-        console.log('[CS] Email not found in localStorage');
-        
-        // Method 2: Try to get from chrome.storage.local (loginEmail from Google Sheets)
+
+        // Method 1: chrome.storage.local (loginEmail from Google Sheet - updated when sheet/popup changes)
         const storageData = await chrome.storage.local.get(['loginEmail']);
         if (storageData.loginEmail && storageData.loginEmail.trim()) {
-            console.log('[CS] Email found in chrome.storage.local:', storageData.loginEmail.substring(0, 5) + '...');
-            return storageData.loginEmail;
+            console.log('[CS] Email from storage (sheet):', storageData.loginEmail.substring(0, 5) + '...');
+            return storageData.loginEmail.trim();
         }
-        console.log('[CS] Email not found in chrome.storage.local');
-        
-        // Method 3: Try to get from Google Sheet directly if we have sheetUrl and startSecond
+
+        // Method 2: Google Sheet directly (if storage not yet set)
         if (monitor.sheetUrl && monitor.startSecond) {
             try {
-                console.log('[CS] Attempting to get email from Google Sheet directly...');
                 const matched_row = await getMatchingRowFromSheet(monitor.sheetUrl, monitor.startSecond);
                 if (matched_row && matched_row.LoginEmail && matched_row.LoginEmail.trim()) {
-                    console.log('[CS] Email found in Google Sheet:', matched_row.LoginEmail.substring(0, 5) + '...');
-                    // Also save it to storage for future use
+                    console.log('[CS] Email from sheet:', matched_row.LoginEmail.substring(0, 5) + '...');
                     await chrome.storage.local.set({ loginEmail: matched_row.LoginEmail });
-                    return matched_row.LoginEmail;
+                    return matched_row.LoginEmail.trim();
                 }
             } catch (e) {
-                console.warn('[CS] Error getting email from Google Sheet:', e.message);
+                console.warn('[CS] Error getting email from sheet:', e.message);
             }
         }
-        
-        // Method 4: Try to get from background script (refresh credentials)
+
+        // Method 3: Refresh credentials from background then storage
         try {
-            console.log('[CS] Attempting to refresh credentials from background script...');
             const response = await new Promise((resolve, reject) => {
                 chrome.runtime.sendMessage({ action: 'refreshCredentials' }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        reject(new Error(chrome.runtime.lastError.message));
-                    } else {
-                        resolve(response);
-                    }
+                    if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+                    else resolve(response);
                 });
             });
-            
             if (response && response.success) {
                 const refreshedData = await chrome.storage.local.get(['loginEmail']);
                 if (refreshedData.loginEmail && refreshedData.loginEmail.trim()) {
-                    console.log('[CS] Email found after refreshing credentials:', refreshedData.loginEmail.substring(0, 5) + '...');
-                    return refreshedData.loginEmail;
+                    console.log('[CS] Email after refresh:', refreshedData.loginEmail.substring(0, 5) + '...');
+                    return refreshedData.loginEmail.trim();
                 }
             }
         } catch (e) {
             console.warn('[CS] Error refreshing credentials:', e.message);
         }
-        
-        console.warn('[CS] Could not find email from any source, returning "Unknown Email"');
+
+        // Method 4: localStorage (legacy / from page scrape - may be stale after sheet update)
+        const userEmail = localStorage.getItem(EMAIL_KEY);
+        if (userEmail && userEmail.trim()) {
+            console.log('[CS] Email from localStorage (fallback):', userEmail.substring(0, 5) + '...');
+            return userEmail.trim();
+        }
+
+        console.warn('[CS] No email from any source, returning "Unknown Email"');
         return "Unknown Email";
     } catch (e) {
         console.error('[CS] Error getting email for notification:', e);
@@ -642,7 +658,10 @@ async function checkOnce() {
     // Pause seat checking during queue error403 wait (5 min)
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
     if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
-        console.log('[CS] error403 pause active - skipping seat check');
+        if (!pauseActiveLogged) {
+            console.log('[CS] error403 pause is active — seat checks and event tab refresh paused until it ends.');
+            pauseActiveLogged = true;
+        }
         return;
     }
 
@@ -738,7 +757,12 @@ async function checkOnce() {
             if (queueItErrorCount >= 1) {
                 console.warn('[CS] 1 consecutive queue-it redirects (count:', queueItErrorCount, '), refreshing...');
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                if (await refreshEventTabWithTracking()) queueItErrorCount = 0;
+                const refreshed = await refreshEventTabWithTracking();
+                queueItErrorCount = 0; // always reset; if pause blocked refresh we wait 60s below
+                if (!refreshed) {
+                    console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                    await delay(60000);
+                }
                 return;
             }
         } else {
@@ -775,8 +799,14 @@ async function checkOnce() {
             
             if (tunnelTimeoutErrorCount >= 2) {
                 console.warn('[CS] 2 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
+                minDelayAfterEventTabRefreshMs = 60000; // wait 60s after this refresh before next API call
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
-                if (await refreshEventTabWithTracking()) tunnelTimeoutErrorCount = 0;
+                const refreshed = await refreshEventTabWithTracking();
+                tunnelTimeoutErrorCount = 0; // always reset; if pause blocked refresh we wait 60s below
+                if (!refreshed) {
+                    console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                    await delay(60000);
+                }
                 return;
             }
         } else {
@@ -791,7 +821,7 @@ async function checkOnce() {
     // Only reset all error counters on successful 200 status
     if (res.status === 200) {
         error403Count = 0;
-        justRefreshedDueTo403 = false;
+        refreshDueTo403Count = 0;
         tunnelTimeoutErrorCount = 0;
         corsErrorCount = 0;
         notfound400erorsCount = 0;
@@ -800,25 +830,34 @@ async function checkOnce() {
 
     // Handle 403 errors separately
     if (res.status === 403) {
-        // If we already refreshed once due to 403 and get 403 again on next check -> clear cookies and refresh immediately
-        if (justRefreshedDueTo403) {
-            console.warn('[CS] 403 after refresh — clearing cookies and refreshing.');
-            justRefreshedDueTo403 = false;
-            error403Count = 0;
-            chrome.runtime.sendMessage({ action: 'clearCookiesAndRefresh' });
-            await delay(2000);
-            await refreshEventTabWithTracking();
-            return;
-        }
-
         error403Count++;
         console.warn('[CS] received 403 Forbidden error from check seats availability API, count:', error403Count);
 
         if (error403Count >= 6) {
-            console.warn('[CS] 6 consecutive 403 errors — refreshing tab.');
-            if (await refreshEventTabWithTracking()) {
-                justRefreshedDueTo403 = true;
+            if (refreshDueTo403Count >= 1) {
+                // Second time we're refreshing due to 403 -> clear cookies and refresh, then reset counter
+                console.warn('[CS] 6 consecutive 403 errors again — clearing cookies and refreshing.');
+                refreshDueTo403Count = 0;
                 error403Count = 0;
+                chrome.runtime.sendMessage({ action: 'clearCookiesAndRefresh' });
+                await delay(2000);
+                const refreshed = await refreshEventTabWithTracking();
+                if (!refreshed) {
+                    console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                    await delay(60000);
+                }
+            } else {
+                // First time: refresh tab only
+                console.warn('[CS] 6 consecutive 403 errors — refreshing tab.');
+                const refreshed = await refreshEventTabWithTracking();
+                if (refreshed) {
+                    refreshDueTo403Count = 1;
+                    error403Count = 0;
+                } else {
+                    error403Count = 0; // reset so we don't burst when pause ends
+                    console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                    await delay(60000);
+                }
             }
         }
 
@@ -834,15 +873,26 @@ async function checkOnce() {
         // If reached 4 errors -> refresh
         if (notfound400erorsCount === 4) {
             console.warn('[CS] 4 consecutive other errors (count:', notfound400erorsCount, ') — refreshing tab.');
-            await refreshEventTabWithTracking();
+            const refreshed = await refreshEventTabWithTracking();
+            if (!refreshed) {
+                notfound400erorsCount = 0;
+                console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                await delay(60000);
+            }
         }
 
         // If reached 7 errors -> clear cookies + refresh
         if (notfound400erorsCount >= 7) {
             console.warn('[CS] 7 or more consecutive other errors (count:', notfound400erorsCount, ') — requesting cookie clear & refresh.');
+            refreshDueTo403Count = 0; // reset 403 refresh counter when clear cookies + refresh is sent
             chrome.runtime.sendMessage({action: "clearCookiesAndRefresh"});
             await delay(2000);
-            if (await refreshEventTabWithTracking()) notfound400erorsCount = 0;
+            const refreshed = await refreshEventTabWithTracking();
+            notfound400erorsCount = 0; // always reset; if pause blocked refresh we wait 60s below
+            if (!refreshed) {
+                console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
+                await delay(60000);
+            }
         }
 
         return;
@@ -857,7 +907,7 @@ async function checkOnce() {
     }
 
     if (!Array.isArray(data) || data.length === 0) {
-        console.log('[CS] Seats API: no areas returned (seat not found).');
+        console.log('\n[CS] Seats API: no areas returned (seat not found).');
         return;
     }
 
@@ -874,6 +924,7 @@ async function checkOnce() {
     }
 
     const toAreaIdNum = (v) => { const n = Number(v); return isNaN(n) ? null : n; };
+    const allAreaIds = data.map(a => toAreaIdNum(a.AreaId)).filter(id => id != null);
     let area = null;
     for (let i = 0; i < data.length; i++) {
         const a = data[i];
@@ -886,6 +937,12 @@ async function checkOnce() {
         break;
     }
     if (!area && (allowedSet || ignoredSet)) {
+        const allowedList = allowedSet ? Array.from(allowedSet) : [];
+        const ignoredList = ignoredSet ? Array.from(ignoredSet) : [];
+        console.log('\n[CS] Seats API areas returned:', allAreaIds.length ? allAreaIds.join(', ') : '(none)');
+        console.log('[CS] Seats monitor areaIds (filter):', allowedList.length ? allowedList.join(', ') : '(none)');
+        console.log('[CS] Seats ignore areaIds:', ignoredList.length ? ignoredList.join(', ') : '(none)');
+
         if (allowedSet) {
             console.log('[CS] Skipping: no areas match areaIds filter (API returned ' + data.length + ' areas).');
             return;
@@ -1134,9 +1191,8 @@ ${seatDetails}
 
 // const message = `Tickets added to basket for Event ${monitor.eventId}. Seat info: ${JSON.stringify(dlJson?.[0]?.products || [])}`;
 // Tickets added to basket for Event 3674. Seat info: [{"kickoff_datetime":"2025-09-06 13:30","category_3":"Club Level Tier 2","position":0,"category_2":"Adult","quantity":1,"price":"39.50","currency":"GBP","seatArea":"46","seatBlock":"46 Club Level","seatRow":"7 ","seatSeat":"122","id":"3674","name":"Arsenal Women v London City Lionesses","category":"Match Tickets","business_line":"eTicketing","filter_event_type":"Away Box Office"}]
-// Get saved email from localStorage
-    const EMAIL_KEY = "user_email";
-    const userEmail = localStorage.getItem(EMAIL_KEY) || "Unknown Email";
+// Use email from sheet (storage) so Discord shows current account after sheet update; fallback to localStorage
+    const userEmail = (await getEmailForNotification()) || "Unknown Email";
 
     // Extract information from dataLayer - look for the last basket_viewed event
     let basketData = null;
@@ -1418,6 +1474,10 @@ ${seatInfo}${pairInfoText}
 function stopMonitoring(reason) {//stop of monitoring will be received from content script signal
     console.log('[CS] stopMonitoring:', reason);
     monitor.running = false;
+    if (nextCheckTimeoutId != null) {
+        clearTimeout(nextCheckTimeoutId);
+        nextCheckTimeoutId = null;
+    }
     if (monitor.intervalId) {
         clearInterval(monitor.intervalId);
         monitor.intervalId = null;
@@ -1464,28 +1524,24 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Helper function to wait for event tab reload completion
-async function waitForEventTabReload(timeoutMs = 140000) {
-    console.log('[CS] Waiting for event tab reload completion...');
-    
+// Helper: wait for event tab to set eventTabReloaded in storage (set by event tab after load + verification token). Timeout 2 min.
+const EVENT_TAB_RELOAD_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+
+async function waitForEventTabReload(timeoutMs = EVENT_TAB_RELOAD_TIMEOUT_MS) {
+    console.log('[CS] Set refresh flag (eventTabReloaded=false). Waiting for event tab to set flag after load (max ' + (timeoutMs / 1000) + 's)...');
     const startTime = Date.now();
     const checkInterval = 1000; // Check every 1 second
-    
+
     while (Date.now() - startTime < timeoutMs) {
         const { eventTabReloaded } = await chrome.storage.local.get('eventTabReloaded');
-        
         if (eventTabReloaded === true) {
-            console.log('[CS] Event tab reload completed successfully');
-            // Reset the flag for next time
+            console.log('[CS] Event tab reload completed (flag set by event tab).');
             await chrome.storage.local.set({ eventTabReloaded: false });
             return true;
         }
-        
-        // Wait before next check
         await new Promise(resolve => setTimeout(resolve, checkInterval));
     }
-    
-    console.warn('[CS] Event tab reload timeout after', timeoutMs / 1000, 'seconds');
+    console.warn('[CS] Event tab reload timeout after ' + (timeoutMs / 1000) + 's — continuing to next API call.');
     return false;
 }
 
@@ -1493,13 +1549,14 @@ async function waitForEventTabReload(timeoutMs = 140000) {
 async function refreshEventTabWithTracking() {
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
     if (error403PauseUntil > 0 && Date.now() < error403PauseUntil) {
-        console.log('[CS] error403 pause active - not sending refresh event tab.');
+        if (!pauseActiveLogged) {
+            console.log('[CS] error403 pause is active — seat checks and event tab refresh paused until it ends.');
+            pauseActiveLogged = true;
+        }
         return false;
     }
-    console.log('[CS] Setting event tab reload flag to false');
     await chrome.storage.local.set({ eventTabReloaded: false });
-    
-    console.log('[CS] Sending refresh event tab message');
+    console.log('[CS] Sending refresh event tab message (event tab will set eventTabReloaded when loaded with verification token).');
     chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
         if (chrome.runtime.lastError) {
             console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
@@ -1507,8 +1564,7 @@ async function refreshEventTabWithTracking() {
             console.log('[CS] refreshEventTab response:', response);
         }
     });
-    
-    // Wait for reload completion instead of fixed time
-    await waitForEventTabReload();
-    return true;
+    const completed = await waitForEventTabReload(EVENT_TAB_RELOAD_TIMEOUT_MS);
+    if (completed) lastEventTabRefreshAt = Date.now();
+    return true; // always return true so caller continues to next API call (timeout or success)
 }

@@ -935,7 +935,7 @@ async function closeOtherEticketingTabs() {
         const url = t.url || '';
         if (!tabUrlIsManagedHost(url)) continue; // not our business
         if (tabIsCheckout(url)) continue;
-        if (url.includes(QUEUE_HOST)) continue; // never close queue tabs
+        if (url.includes(QUEUE_HOST) && !url.toLowerCase().includes('error403')) continue; // keep normal queue tabs, allow closing queue error403
 
         const isEventTab = eventUrl && url.startsWith(eventUrl);
         const isValidationTab = validationUrl && url.startsWith(validationUrl);
@@ -972,21 +972,22 @@ async function notifyValidationTabError403Resume() {
     if (validationTabs.length) console.log('[BG] Sent error403Resume to', validationTabs.length, 'validation tab(s)');
 }
 
-/** Runs every 2 min (alarm). If sheet status is on: ensure event tab exists; close any unnecessary tabs (only event + validation allowed). */
+/** Runs every 2 min (alarm).
+ * If sheet status is on: ensure event tab exists (unless error403 pause or heartbeat reload running),
+ * and always close unnecessary tabs (including queue error403 and arsenal profile tabs).
+ */
 async function checkEventTabAndCreateIfMissing() {
     if (lastStatus !== 'on') return;
-    if (Date.now() < error403PauseUntil) return;
-    if (openOrFocusTabsInProgress) return; // avoid creating second event tab while heartbeat reload (openOrFocusTabs) is running
+    const pausedForError403 = Date.now() < error403PauseUntil;
     const { eventUrl, inQueueWaiting } = await chrome.storage.local.get(['eventUrl', 'inQueueWaiting']);
-    if (!eventUrl) return;
-    if (inQueueWaiting) return;
-
-    const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
-    const eventTabExists = tabs.some(t => t.url && t.url.startsWith(eventUrl));
-    if (!eventTabExists) {
-        EVENT_URL = eventUrl;
-        console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
-        await refreshEventTab();
+    if (eventUrl && !inQueueWaiting && !pausedForError403 && !openOrFocusTabsInProgress) {
+        const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
+        const eventTabExists = tabs.some(t => t.url && t.url.startsWith(eventUrl));
+        if (!eventTabExists) {
+            EVENT_URL = eventUrl;
+            console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
+            await refreshEventTab();
+        }
     }
     await closeOtherEticketingTabs();
 }
@@ -1178,7 +1179,8 @@ async function sendErrorWebhook(errorWebhook, message, payload) {
     }
 }
 
-// Default Discord webhook for success notifications (always sent for all clubs)
+// Default Discord webhook for success notifications.
+// If Google Sheet uses the same URL, we still send exactly once (no duplicates, no missing notifications).
 const DEFAULT_SUCCESS_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br';
 
 async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
@@ -1189,35 +1191,24 @@ async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
     });
     const discordBody = JSON.stringify({content: message, embeds: []});
 
-    // 1) Always send success notification to default Discord webhook for all clubs
-    try {
-        console.log('[BG] Sending to default success Discord webhook');
-        await fetch(DEFAULT_SUCCESS_DISCORD_WEBHOOK, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: discordBody
-        });
-        console.log('[BG] Default success Discord webhook sent');
-    } catch (e) {
-        console.warn('[BG] default discord webhook send failed', e);
-    }
+    // Build a unique set of Discord webhook targets (default + optional sheet webhook).
+    const targets = new Set();
+    if (DEFAULT_SUCCESS_DISCORD_WEBHOOK) targets.add(DEFAULT_SUCCESS_DISCORD_WEBHOOK);
+    if (discordWebhook && discordWebhook.trim()) targets.add(discordWebhook.trim());
 
-    // 2) If Google sheet provides another Discord webhook, also send there (no duplicate if same URL)
-    try {
-        if (discordWebhook && discordWebhook.trim()) {
-            const sheetWebhook = discordWebhook.trim();
-            if (sheetWebhook !== DEFAULT_SUCCESS_DISCORD_WEBHOOK) {
-                console.log('[BG] Sending to sheet Discord webhook:', sheetWebhook);
-                await fetch(sheetWebhook, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: discordBody
-                });
-                console.log('[BG] Sheet Discord webhook sent');
-            }
+    // Send once to each unique Discord webhook URL.
+    for (const url of targets) {
+        try {
+            console.log('[BG] Sending to Discord webhook:', url === DEFAULT_SUCCESS_DISCORD_WEBHOOK ? 'default' : url);
+            await fetch(url, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: discordBody
+            });
+            console.log('[BG] Discord webhook sent:', url === DEFAULT_SUCCESS_DISCORD_WEBHOOK ? 'default' : url);
+        } catch (e) {
+            console.warn('[BG] Discord webhook send failed for', url, e);
         }
-    } catch (e) {
-        console.warn('[BG] sheet discord send failed', e);
     }
     try {
         if (telegramWebhook) {

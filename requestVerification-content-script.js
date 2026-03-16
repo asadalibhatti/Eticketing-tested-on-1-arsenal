@@ -36,10 +36,13 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
         const TOKEN_KEY = "verification_token";
         const EMAIL_KEY = "user_email";
 
+        console.log("[CS] Event page detected. Will wait for verification token dynamically and proceed as soon as it is available...");
 
-        console.log("[CS] Event page detected. Will extract token and email in 30 seconds...");
+        const MAX_TOKEN_WAIT_MS = 30000; // safety cap: stop trying after 30s
+        const POLL_INTERVAL_MS = 500;
+        let waitedMs = 0;
 
-        setTimeout(() => {
+        const tryExtractTokenAndEmail = () => {
             let token = null;
             let email = null;
 
@@ -53,7 +56,7 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
             }
 
             if (!token) {
-                let metaToken = document.querySelector('meta[name="__RequestVerificationToken"]');
+                let metaToken = document.querySelector('meta[name=\"__RequestVerificationToken\"]');
                 if (metaToken) {
                     token = metaToken.getAttribute("content");
                     console.log("[CS] Token found via meta tag:", token);
@@ -62,7 +65,7 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
 
             if (!token) {
                 let html = document.documentElement.innerHTML;
-                let match = html.match(/__RequestVerificationToken"\s*value="([^"]+)"/);
+                let match = html.match(/__RequestVerificationToken\"\\s*value=\"([^\"]+)\"/);
                 if (match) {
                     token = match[1];
                     console.log("[CS] Token found via HTML regex:", token);
@@ -72,35 +75,49 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
             if (token) {
                 localStorage.setItem(TOKEN_KEY, token);
                 console.log("[CS] Token saved to localStorage");
-                
-                // Set event tab reload flag to true to indicate successful reload
+                // Signal to content script that event tab has loaded and verification token is ready (so next seat API can run)
                 chrome.storage.local.set({ eventTabReloaded: true });
-                console.log("[CS] Event tab reload flag set to true");
-            } else {
-                console.warn("[CS] No verification token found.");
-            }
+                console.log("[CS] Event tab reload flag set (eventTabReloaded=true) — page loaded with token.");
 
-            // ----------------------
-            // Extract email
-            // ----------------------
-            let emailInput = document.querySelector('#NewClientEmail');
-            if (emailInput) {
-                // Try reading from data attribute first
-                email = emailInput.getAttribute('data-my-email')
-                    || emailInput.value
-                    || emailInput.placeholder;
+                // ----------------------
+                // Extract email (at same time as token)
+                // ----------------------
+                let emailInput = document.querySelector('#NewClientEmail');
+                if (emailInput) {
+                    email = emailInput.getAttribute('data-my-email')
+                        || emailInput.value
+                        || emailInput.placeholder;
 
-                if (email && email.includes('@')) {
-                    localStorage.setItem(EMAIL_KEY, email);
-                    console.log("[CS] Email found and saved to localStorage:", email);
+                    if (email && email.includes('@')) {
+                        localStorage.setItem(EMAIL_KEY, email);
+                        console.log("[CS] Email found and saved to localStorage:", email);
+                    } else {
+                        console.warn("[CS] No valid email found in input.");
+                    }
                 } else {
-                    console.warn("[CS] No valid email found in input.");
+                    console.warn("[CS] No email input element found.");
                 }
-            } else {
-                console.warn("[CS] No email input element found.");
+                return true;
             }
 
-        }, 5000); // wait 15 seconds
+            return false;
+        };
+
+        // Poll for token until found or timeout
+        const pollForToken = () => {
+            if (tryExtractTokenAndEmail()) {
+                return; // success, stop polling
+            }
+            waitedMs += POLL_INTERVAL_MS;
+            if (waitedMs >= MAX_TOKEN_WAIT_MS) {
+                console.warn("[CS] No verification token found within " + (MAX_TOKEN_WAIT_MS / 1000) + "s.");
+                return;
+            }
+            setTimeout(pollForToken, POLL_INTERVAL_MS);
+        };
+
+        // Start polling immediately; will proceed as soon as token appears in DOM
+        pollForToken();
 
 
         // Helpers
