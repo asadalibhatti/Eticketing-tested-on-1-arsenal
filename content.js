@@ -37,13 +37,20 @@ let monitor = {
     startSecond: null,
     areSeatsTogether: false,
     quantity: null,
+    /** When non-null (0–100), each checkOnce rolls pair vs single; updated when sheet row is read. */
+    pairCheckChancePct: null,
     discordWebhook: null,
+    /** Bot token from sheet column TelegramBotToken (stored under this key for compatibility). */
     telegramWebhook: null,
+    telegramChatId: null,
     eventUrl: null,
     eventId: null,
     intervalId: null,
     last403Time: 0
 };
+
+/** Default % chance to use Resale endpoint when sheet column "Resale Endpoint Chances" is missing or unset. */
+const DEFAULT_RESALE_ENDPOINT_CHANCES = 96;
 
 // Club-based PriceClassId mapping
 const clubPriceClassIdMap = {
@@ -127,8 +134,13 @@ async function startMonitorFlow() {
     const {sheetUrl, startSecond} = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
     monitor.sheetUrl = sheetUrl;
     monitor.startSecond = startSecond;
-    const {eventUrl} = await chrome.storage.local.get('eventUrl');
+    const { eventUrl, discordWebhook, telegramWebhook, telegramChatId } = await chrome.storage.local.get([
+        'eventUrl', 'discordWebhook', 'telegramWebhook', 'telegramChatId'
+    ]);
     monitor.eventUrl = eventUrl;
+    if (discordWebhook) monitor.discordWebhook = discordWebhook;
+    if (telegramWebhook) monitor.telegramWebhook = telegramWebhook;
+    if (telegramChatId != null && String(telegramChatId).trim() !== '') monitor.telegramChatId = String(telegramChatId).trim();
     monitor.areSeatsTogether = await chrome.storage.local.get('areSeatsTogether').then(res => res.areSeatsTogether === true);
     monitor.quantity = await chrome.storage.local.get('quantity').then(res => parseInt(res.quantity || '1', 10));
     monitor.eventId = await chrome.storage.local.get('eventId').then(res => res.eventId || null);
@@ -144,11 +156,13 @@ async function startMonitorFlow() {
             //read from sheet
             const row = await getMatchingRowFromSheet(monitor.sheetUrl, monitor.startSecond);
             if (row) {
-                monitor.eventUrl = row.EventUrl;
+                const ev = eventUrlFromSheetRow(row);
+                if (ev) monitor.eventUrl = ev;
                 monitor.startSecond = parseFloat(row.StartSecond) ?? monitor.startSecond;
-                monitor.areSeatsTogether = row.AreSeatsTogether === true || ('' + row.AreSeatsTogether).toLowerCase() === 'true';
-                monitor.quantity = parseInt(row.Quantity || '1', 10);
-                
+                syncSeatPairSettingsFromSheetRow(row);
+                rollSeatPairModeIfChanceActive();
+                syncMonitorMessagingFromSheetRow(row);
+
                 // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
                 // Try multiple variations of the areaIds column name
                 const areaIdsValue = row['areaIds to monitor'] || row['AreaIds to monitor'] || row['areaIds to Monitor'] || 
@@ -159,13 +173,19 @@ async function startMonitorFlow() {
                                           row.AreasToIgnore || row.areasToIgnore || row['AreasToIgnore'] || row['areasToIgnore'] || '';
                 
                 
+                const resaleChancesInit = getResaleEndpointChancesFromRow(row);
                 await chrome.storage.local.set({
                     areSeatsTogether: monitor.areSeatsTogether,
                     quantity: monitor.quantity,
+                    eventUrl: monitor.eventUrl || '',
+                    discordWebhook: monitor.discordWebhook || '',
+                    telegramWebhook: monitor.telegramWebhook || '',
+                    telegramChatId: monitor.telegramChatId || '',
                     loginEmail: row.LoginEmail || '',
                     loginPassword: row.LoginPassword || '',
                     areaIds: areaIdsValue,
-                    areasToIgnore: areasToIgnoreValue
+                    areasToIgnore: areasToIgnoreValue,
+                    resaleEndpointChances: resaleChancesInit != null ? resaleChancesInit : DEFAULT_RESALE_ENDPOINT_CHANCES
                 });
             } else {
                 console.warn('[CS] no matching row found in sheet for startSecond', monitor.startSecond);
@@ -251,7 +271,8 @@ async function scheduleNextCheck() {
     const dateNow = new Date();
     // Single formula: next API call = next time clock (sec % 12) matches extension number
     let delay = getAlignMsToNextInterval(dateNow, base, waitMs);
-    // After an event tab refresh, wait at least minDelayAfterEventTabRefreshMs before next API call (15s default; 60s after tunnel/timeout refresh)
+    // After event tab refresh **timed out** (tab never signalled ready), add a cooldown before next API call.
+    // Successful reload already waited for verification token — do not add extra delay; stay on 12s clock alignment.
     if (lastEventTabRefreshAt > 0) {
         const minDelayAfterRefresh = minDelayAfterEventTabRefreshMs;
         const elapsedSinceRefresh = now - lastEventTabRefreshAt;
@@ -260,7 +281,7 @@ async function scheduleNextCheck() {
             delay = Math.max(delay, extraWait);
         }
         lastEventTabRefreshAt = 0;
-        minDelayAfterEventTabRefreshMs = 15000; // reset to default for next refresh
+        minDelayAfterEventTabRefreshMs = 15000;
     }
     // If the next call would happen too soon (<7s), skip to the next 12s cycle so we don't hammer the API,
     // while still keeping alignment to the 12s clock.
@@ -327,6 +348,74 @@ async function alignToStartSecond(startSec) {
     else waitMs = ((60 - curSec) + startSec) * 1000;
     console.log(`[CS] aligning to second ${startSec}. waiting ${waitMs / 1000}s`);
     return new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
+/** Google Sheet column "Resale Endpoint Chances": 100 = always resale, 50 = ~50% resale / ~50% regular, 0 = always regular. Missing column → null (caller uses DEFAULT_RESALE_ENDPOINT_CHANCES). */
+function getResaleEndpointChancesFromRow(row) {
+    if (!row) return null;
+    const raw = row['Resale Endpoint Chances'] ?? row['resale endpoint chances'] ?? row.ResaleEndpointChances ?? row.resaleEndpointChances;
+    if (raw === '' || raw == null || String(raw).trim() === '') return null;
+    const n = parseFloat(String(raw).replace(/%/g, '').trim());
+    if (!Number.isFinite(n)) return null;
+    return Math.min(100, Math.max(0, n));
+}
+
+/**
+ * Google Sheet "Pair check chance": empty → null (use AreSeatsTogether + Quantity as written).
+ * 0–100: each time this runs, with probability pct% use AreSeatsTogether=true & Quantity=2, else false & 1.
+ * 100 = always pair (ignores the AreSeatsTogether / Quantity cells for that roll).
+ */
+function getPairCheckChanceFromRow(row) {
+    if (!row) return null;
+    const raw = row['Pair check chance'] ?? row['Pair Check Chance'] ?? row['pair check chance'] ?? row.PairCheckChance ?? row.pairCheckChance;
+    if (raw === '' || raw == null || String(raw).trim() === '') return null;
+    const n = parseFloat(String(raw).replace(/%/g, '').trim());
+    if (!Number.isFinite(n)) return null;
+    return Math.min(100, Math.max(0, n));
+}
+
+/** Event URL from sheet row (header name variants). */
+function eventUrlFromSheetRow(row) {
+    if (!row) return '';
+    const u = row.EventUrl ?? row['Event URL'] ?? row['event url'] ?? row.EventURL ?? row.eventUrl;
+    if (u == null) return '';
+    return String(u).trim();
+}
+
+/** Sheet → monitor: DiscordWebhook, TelegramBotToken (stored as telegramWebhook), TelegramChatID. Empty cell clears that field. */
+function syncMonitorMessagingFromSheetRow(row) {
+    if (!row) return;
+    if (row.DiscordWebhook !== undefined) {
+        monitor.discordWebhook = String(row.DiscordWebhook ?? '').trim();
+    }
+    if (row.TelegramBotToken !== undefined || row.TelegramWebhook !== undefined) {
+        monitor.telegramWebhook = String(row.TelegramBotToken ?? row.TelegramWebhook ?? '').trim();
+    }
+    if (row.TelegramChatID !== undefined || row.TelegramChatId !== undefined) {
+        monitor.telegramChatId = String(row.TelegramChatID ?? row.TelegramChatId ?? '').trim();
+    }
+}
+
+/** Reads sheet row: stores pair-check %; if empty, applies AreSeatsTogether + Quantity from sheet. */
+function syncSeatPairSettingsFromSheetRow(row) {
+    monitor.pairCheckChancePct = getPairCheckChanceFromRow(row);
+    if (monitor.pairCheckChancePct == null) {
+        monitor.areSeatsTogether = row.AreSeatsTogether === true || ('' + row.AreSeatsTogether).toLowerCase() === 'true';
+        monitor.quantity = parseInt(row.Quantity || '1', 10);
+    }
+}
+
+/** When Pair check chance is set, roll every seat API cycle (pair = true & 2, else false & 1). */
+function rollSeatPairModeIfChanceActive() {
+    const pct = monitor.pairCheckChancePct;
+    if (pct == null) return;
+    if (Math.random() * 100 < pct) {
+        monitor.areSeatsTogether = true;
+        monitor.quantity = 2;
+    } else {
+        monitor.areSeatsTogether = false;
+        monitor.quantity = 1;
+    }
 }
 
 async function getMatchingRowFromSheet(sheetUrl, startSecond) {
@@ -399,8 +488,8 @@ let checksheet = true;//read sheet one time and not next and so on
 // Separate error counters for different error types
 let error403Count = 0;           // For 403 Forbidden errors
 let refreshDueTo403Count = 0;   // number of times we've done "refresh tab" due to 403; clear cookies only when this is the second such refresh
-let lastEventTabRefreshAt = 0;  // timestamp when event tab refresh completed; next API call delayed after this
-let minDelayAfterEventTabRefreshMs = 15000; // 15s default; set to 60000 before tunnel/timeout refresh so next API waits 60s
+let lastEventTabRefreshAt = 0;  // set only when event tab reload **times out** — then next API waits minDelayAfterEventTabRefreshMs
+let minDelayAfterEventTabRefreshMs = 15000; // cooldown after failed reload wait (successful reload uses 12s alignment only)
 let tunnelTimeoutErrorCount = 0; // For tunnel connection and timeout errors
 let corsErrorCount = 0;          // For CORS errors
 let notfound400erorsCount = 0;   // For other HTTP errors (400, 401, 402, 302, 500)
@@ -489,7 +578,7 @@ async function tryDirectAddToBasketSecondapi(data, clubname, eventId, verificati
         }
     }
 
-    console.log('[CS] Direct add to basket (' + endpointType + '): ' + successCount + ' seat(s) added from ' + totalFetchCount + ' attempt(s), ' + areasToTry.length + ' area(s) tried.');
+    // No log here (hot path); outcome logged by caller after basket flow completes or fails
     return successCount > 0; // True if at least one success
 }
 
@@ -531,7 +620,6 @@ function parseBasketHtml(html) {
                 price: priceElement?.textContent?.trim()
             };
             
-            console.log(`[CS] Parsed basket item ${index + 1}:`, seatData);
             basketEvents.push(seatData);
         });
         
@@ -658,6 +746,54 @@ async function getEmailForNotification() {
     }
 }
 
+/** Strip HTML from lock/error responses; preserve line breaks where possible (e.g. ticket limit messages). */
+function plainTextFromLockApiBody(raw) {
+    if (raw == null || typeof raw !== 'string') return '';
+    return raw
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|div|h[1-6]|li)\s*>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .split('\n')
+        .map((s) => s.replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+}
+
+/** Read `fetch` response body once; normalize HTML or plain text for notifications. */
+async function plainTextFromFetchResponse(res) {
+    if (!res || typeof res.text !== 'function') return '';
+    try {
+        return plainTextFromLockApiBody(await res.text());
+    } catch (_) {
+        return '';
+    }
+}
+
+/** Non-empty API body snippet for Discord (capped length for webhook limits). */
+function discordResponseBodySection(label, plain) {
+    if (!plain || !String(plain).trim()) return '';
+    const max = 1800;
+    let s = String(plain).trim();
+    if (s.length > max) s = s.slice(0, max) + '\n… (truncated)';
+    return '\n📄 **' + label + ':**\n' + s + '\n';
+}
+
+/** Event ID + URL for every Discord/Telegram error (monitor may omit URL briefly — still show "(not set)"). */
+function formatNotificationEventContext() {
+    const u = (monitor.eventUrl || '').trim();
+    const idRaw = monitor.eventId;
+    const id = idRaw != null && String(idRaw).trim() !== '' ? String(idRaw).trim() : '';
+    let s = '';
+    if (id) s += '\n🆔 **Event ID:** ' + id;
+    s += '\n🔗 **Event URL:** ' + (u || '(not set)');
+    return s;
+}
+
 async function checkOnce() {
     if (!monitor.running) return;
 
@@ -671,16 +807,32 @@ async function checkOnce() {
         return;
     }
 
+    const storageSnap = await chrome.storage.local.get(['eventUrl', 'startSecond']);
+    const storedEv = (storageSnap.eventUrl || '').trim();
+    if (storedEv && storedEv !== (monitor.eventUrl || '').trim()) {
+        monitor.eventUrl = storedEv;
+        monitor.eventId = extractEventId(storedEv);
+        console.log('[CS] eventUrl synced from storage (e.g. sheet poll while monitoring)');
+    }
+    if (storageSnap.startSecond != null && storageSnap.startSecond !== '') {
+        const ss = parseFloat(storageSnap.startSecond);
+        if (!Number.isNaN(ss) && ss !== monitor.startSecond) {
+            monitor.startSecond = ss;
+        }
+    }
+
     let matched_row = null;
     if (checksheet) {
         matched_row = await getMatchingRowFromSheet(monitor.sheetUrl, monitor.startSecond);
         if (matched_row) {
-            monitor.discordWebhook = matched_row.DiscordWebhook || monitor.discordWebhook;
-            monitor.telegramWebhook = matched_row.TelegramWebhook || monitor.telegramWebhook;
-            monitor.eventUrl = matched_row.EventUrl || monitor.eventUrl;
-            monitor.areSeatsTogether = matched_row.AreSeatsTogether === true || ('' + matched_row.AreSeatsTogether).toLowerCase() === 'true';
-            monitor.quantity = parseInt(matched_row.Quantity || '1', 10);
-            
+            const sheetEv = eventUrlFromSheetRow(matched_row);
+            if (sheetEv) {
+                monitor.eventUrl = sheetEv;
+                monitor.eventId = extractEventId(sheetEv);
+            }
+            syncSeatPairSettingsFromSheetRow(matched_row);
+            syncMonitorMessagingFromSheetRow(matched_row);
+
             // Save AreSeatsTogether, Quantity, and login credentials to local storage to avoid name mismatch
             // Try multiple variations of the areaIds column name
             const areaIdsValue = matched_row['areaIds to monitor'] || matched_row['AreaIds to monitor'] || matched_row['areaIds to Monitor'] || 
@@ -690,14 +842,17 @@ async function checkOnce() {
             const areasToIgnoreValue = matched_row['areas to ignore'] || matched_row['Areas to ignore'] || matched_row['Areas to Ignore'] || 
                                       matched_row.AreasToIgnore || matched_row.areasToIgnore || matched_row['AreasToIgnore'] || matched_row['areasToIgnore'] || '';
             
-            
+            const resaleChances = getResaleEndpointChancesFromRow(matched_row);
             await chrome.storage.local.set({
-                areSeatsTogether: monitor.areSeatsTogether,
-                quantity: monitor.quantity,
                 loginEmail: matched_row.LoginEmail || '',
                 loginPassword: matched_row.LoginPassword || '',
+                eventUrl: monitor.eventUrl || '',
+                discordWebhook: monitor.discordWebhook || '',
+                telegramWebhook: monitor.telegramWebhook || '',
+                telegramChatId: monitor.telegramChatId || '',
                 areaIds: areaIdsValue,
-                areasToIgnore: areasToIgnoreValue
+                areasToIgnore: areasToIgnoreValue,
+                resaleEndpointChances: resaleChances != null ? resaleChances : DEFAULT_RESALE_ENDPOINT_CHANCES
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
@@ -716,6 +871,12 @@ async function checkOnce() {
         checksheet = true;
     }
 
+    rollSeatPairModeIfChanceActive();
+    await chrome.storage.local.set({
+        areSeatsTogether: monitor.areSeatsTogether,
+        quantity: monitor.quantity != null ? monitor.quantity : 1
+    });
+
     if (!monitor.eventId) {
         monitor.eventId = extractEventId(monitor.eventUrl || location.href);
         if (!monitor.eventId) {
@@ -730,15 +891,22 @@ async function checkOnce() {
     }
 
     const clubName = getClubName(monitor.eventUrl);
-    const isResale = (() => {
-        const now = Date.now();
-        const randomSeed = Math.random();
-        const combinedSeed = (now % 1000) + (randomSeed * 1000);
-        return (combinedSeed % 100) < 96;
-    })();
+    const { resaleEndpointChances: storedResalePct } = await chrome.storage.local.get(['resaleEndpointChances']);
+    let resalePct = parseFloat(storedResalePct);
+    if (!Number.isFinite(resalePct)) resalePct = DEFAULT_RESALE_ENDPOINT_CHANCES;
+    resalePct = Math.min(100, Math.max(0, resalePct));
+    const isResale = Math.random() * 100 < resalePct;
     const endpointType = isResale ? 'Resale' : 'Regular';
     const marketTypeParam = isResale ? '&MarketType=1' : '';
     const url = `https://www.eticketing.co.uk/${clubName}/EDP/Seats/Available${endpointType}?AreSeatsTogether=${monitor.areSeatsTogether}&EventId=${monitor.eventId}${marketTypeParam}&MaximumPrice=10000000&MinimumPrice=0&Quantity=${monitor.quantity}`;
+
+    const seatsCheckEndpointLabel = endpointType;
+    let seatsCheckHttpStatus = null;
+    const logSeatsOutcome = (detail) => {
+        const http = seatsCheckHttpStatus != null ? String(seatsCheckHttpStatus) : 'n/a';
+        const q = monitor.quantity != null ? monitor.quantity : '?';
+        console.log('[CS] ' + detail + ' | Seats check: ' + seatsCheckEndpointLabel + ', HTTP ' + http + ', quantity: ' + q);
+    };
 
     let res;
     try {
@@ -751,6 +919,7 @@ async function checkOnce() {
             },
             credentials: "include"
         });
+        seatsCheckHttpStatus = res.status;
 
         // Reset queue-it error count on successful fetch
         // queueItErrorCount = 0;
@@ -769,6 +938,7 @@ async function checkOnce() {
                     console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
                     await delay(60000);
                 }
+                logSeatsOutcome('Redirected to queue');
                 return;
             }
         } else {
@@ -805,7 +975,6 @@ async function checkOnce() {
             
             if (tunnelTimeoutErrorCount >= 2) {
                 console.warn('[CS] 2 consecutive tunnel/timeout errors (count:', tunnelTimeoutErrorCount, '), refreshing...');
-                minDelayAfterEventTabRefreshMs = 60000; // wait 60s after this refresh before next API call
                 chrome.runtime.sendMessage({action: 'closeOtherTabsExcept'});
                 const refreshed = await refreshEventTabWithTracking();
                 tunnelTimeoutErrorCount = 0; // always reset; if pause blocked refresh we wait 60s below
@@ -813,6 +982,7 @@ async function checkOnce() {
                     console.log('[CS] Refresh blocked by pause — waiting 60s before continuing.');
                     await delay(60000);
                 }
+                logSeatsOutcome('Tunnel/timeout — refresh triggered');
                 return;
             }
         } else {
@@ -821,6 +991,7 @@ async function checkOnce() {
         }
 
         notfound400erorsCount++;
+        logSeatsOutcome('Seats API fetch failed (see error above)');
         return;
     }
 
@@ -842,6 +1013,7 @@ async function checkOnce() {
         // At 3 consecutive 403s: pause 90s, then resume on normal schedule; do not reset counter
         if (error403Count === 3) {
             console.warn('[CS] 3 consecutive 403 errors — pausing 90s before next seat API call.');
+            logSeatsOutcome('403 — pausing 90s (3 consecutive)');
             await delay(90000);
             return;
         }
@@ -874,6 +1046,7 @@ async function checkOnce() {
             }
         }
 
+        logSeatsOutcome('403 Forbidden on seats check');
         return;
     }
 
@@ -882,6 +1055,7 @@ async function checkOnce() {
     if (otherErrorStatuses.includes(res.status)) {
         notfound400erorsCount++;
         console.warn('[CS] received error status from check seats availability API:', res.status, ', count:', notfound400erorsCount);
+        logSeatsOutcome('Seats check HTTP ' + res.status);
 
         // If reached 4 errors -> refresh
         if (notfound400erorsCount === 4) {
@@ -916,11 +1090,12 @@ async function checkOnce() {
         data = await res.json();
     } catch (e) {
         console.warn('[CS] seats response JSON parse failed', e);
+        logSeatsOutcome('Seats response JSON parse failed');
         return;
     }
 
     if (!Array.isArray(data) || data.length === 0) {
-        console.log('\n[CS] Seats API: no areas returned (seat not found).');
+        logSeatsOutcome('No areas returned (seat not found)');
         return;
     }
 
@@ -957,18 +1132,22 @@ async function checkOnce() {
         console.log('[CS] Seats ignore areaIds:', ignoredList.length ? ignoredList.join(', ') : '(none)');
 
         if (allowedSet) {
-            console.log('[CS] Skipping: no areas match areaIds filter (API returned ' + data.length + ' areas).');
+            logSeatsOutcome('No area matches monitor filter (API returned ' + data.length + ' areas)');
             return;
         }
         area = data.find(a => {
             const id = toAreaIdNum(a.AreaId);
             return id != null && a.PriceBands && a.PriceBands.length && (!ignoredSet || !ignoredSet.has(id));
         }) || null;
-        if (!area) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
+        if (!area) {
+            logSeatsOutcome('No area matches monitor/ignore after filtering (API returned ' + data.length + ' areas)');
+            return;
+        }
     }
-    if (!area) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
+    // Only fallback to "any area" when there are NO filters configured.
+    if (!area && !(allowedSet || ignoredSet)) area = data.find(a => a.PriceBands && a.PriceBands.length) || data[0];
     if (!area) {
-        console.log('[CS] Skipping: no area with PriceBands in API response.');
+        logSeatsOutcome('No area with PriceBands in API response');
         return;
     }
 
@@ -1017,51 +1196,57 @@ async function checkOnce() {
             body: JSON.stringify(lockBody)
         });
     } catch (e) {
-        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (' + e.message + ').');
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `\n\nError locking seats: ${e.message} for AreaId ${areaId} PriceBandId ${priceBandId}\n👤 **Account:** ${email}`,
+            message: `\n\nError locking seats: ${e.message} for AreaId ${areaId} PriceBandId ${priceBandId}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}`,
             payload: null
         });
+        logSeatsOutcome('Lock request failed: ' + e.message);
         return;
     }
 
     if (lockRes.status === 403) {
-        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: 403, trying direct add to basket.');
+        let lock403Plain = '';
+        try {
+            lock403Plain = plainTextFromLockApiBody(await lockRes.text());
+        } catch (e) {
+            lock403Plain = '';
+        }
+
         if (!(await tryDirectAddToBasketSecondapi(data, clubName, monitor.eventId, verificationToken, endpointType))) {
-            console.warn('[CS] Direct add to basket failed for all areas.');
-            
-            // Send webhook message about the failure
             const email = await getEmailForNotification();
-            const errorMessage = `🎫 Direct add to basket failed for all areas. Event ${monitor.eventId}. Seats were found but could not be added to basket.\n👤 **Account:** ${email}`;
+            const errorMessage = `🎫 Direct add to basket failed for all areas. Seats were found but could not be added to basket.${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (403) response', lock403Plain)}`;
             chrome.runtime.sendMessage({
                 action: 'notifyErrorWebhooks',
                 message: errorMessage,
                 payload: null
             });
-            
+            logSeatsOutcome('Direct add to basket failed (lock was 403)');
+            if (lock403Plain) {
+                console.log('[CS] Lock API (403) response text:\n' + lock403Plain);
+            }
             return;
         }
     } else if (lockRes.status === 400 || lockRes.status === 404) {
-        lockResponseHtmlText = await lockRes.text();
-        lockResponseHtmlText = lockResponseHtmlText.replace(/<[^>]*>?/g, '').replace(/\n/g, '');
-        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (status ' + lockRes.status + ').');
+        const lockErrPlain = await plainTextFromFetchResponse(lockRes);
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `\n🎫 Seat AreaId ${areaId} PriceBandId ${priceBandId} found but not locked. Status: ${lockRes.status}\n👤 **Account:** ${email}`,
+            message: `\n🎫 Seat AreaId ${areaId} PriceBandId ${priceBandId} found but not locked. Status: ${lockRes.status}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
             payload: null
         });
+        logSeatsOutcome('Lock failed HTTP ' + lockRes.status);
         return;
     } else if (lockRes.status !== 200) {
-        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: failed (status ' + lockRes.status + ').');
+        const lockErrPlain = await plainTextFromFetchResponse(lockRes);
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `🎫 Error locking seats: ${lockRes.status} for AreaId ${areaId}\n👤 **Account:** ${email}`,
+            message: `🎫 Error locking seats: ${lockRes.status} for AreaId ${areaId}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
             payload: null
         });
+        logSeatsOutcome('Lock failed HTTP ' + lockRes.status);
         return;
     } else {
 
@@ -1069,18 +1254,14 @@ async function checkOnce() {
         try {
             lockJson = await lockRes.json();
         } catch (e) {
-            console.warn('[CS] lock JSON parse failed', e);
             lockJson = null;
         }
 
         const lockedSeats = lockJson?.LockedSeats;
         if (!lockedSeats || lockedSeats.length === 0) {
-            console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: 200 but no LockedSeats in response.');
+            logSeatsOutcome('Lock HTTP 200 but no LockedSeats in response');
             return;
         }
-
-        const foundAreaIds = data.map(a => toAreaIdNum(a.AreaId)).filter(id => id != null);
-        console.log('[CS] Seats API: ' + data.length + ' area(s). After filters: AreaId ' + areaId + ', PriceBand ' + priceBandId + '. Lock: success. Monitor: ' + (areaIds === '' || areaIds == null ? '(any)' : areaIds) + ' | ignore: ' + (areasToIgnore === '' || areasToIgnore == null ? '(none)' : areasToIgnore) + ' | API areas: ' + (foundAreaIds.length ? foundAreaIds.join(', ') : '(none)'));
 
         const priceClassId = getPriceClassIdForClub(clubName);
         let seatsToAdd;
@@ -1114,14 +1295,13 @@ async function checkOnce() {
                 body: JSON.stringify(putBody)
             });
         } catch (e) {
-            console.error('[CS] add to basket fetch failed', e);
+            logSeatsOutcome('Add-to-basket request failed before HTTP response');
             return;
         }
 
         // Check if add to basket failed (not 200 or 201)
         if (putRes.status !== 200 && putRes.status !== 201) {
-            console.error('[CS] Seat locked but failed to add to basket (status', putRes.status + ')');
-            
+            const putErrPlain = await plainTextFromFetchResponse(putRes);
             // Get email for notification
             const email = await getEmailForNotification();
             
@@ -1135,36 +1315,34 @@ async function checkOnce() {
 ════════════════════════════════════════════════════════════════
 🎫 **Status:** Seat locked successfully but failed to add to basket (HTTP ${putRes.status})
 🆔 **Event ID:** ${monitor.eventId}
-🔗 **Event URL:** ${monitor.eventUrl}
+🔗 **Event URL:** ${monitor.eventUrl || '(not set)'}
 📍 **Area ID:** ${areaId}
+🔢 **Quantity:** ${monitor.quantity}
 👤 **Account:** ${email}
             
 🎫 **LOCKED SEATS:**
 ${seatDetails}
-            
+${discordResponseBodySection('Basket PUT (HTTP ' + putRes.status + ') response', putErrPlain)}            
 ⚠️ **Action Required:** Please check the basket manually or try again.
 ════════════════════════════════════════════════════════════════`;
             
-            console.error('[CS] Sending error notification for locked seat not added to basket');
             chrome.runtime.sendMessage({
                 action: 'notifyErrorWebhooks',
                 message: errorMessage,
                 payload: null
             });
-            
+            logSeatsOutcome('Basket PUT failed HTTP ' + putRes.status);
             // Return early to prevent success notification
             return;
         }
         
-        // Ticket successfully added to basket (status 200 or 201)
-        console.log('[CS] Ticket successfully added to basket, waiting 2 seconds before fetching data layer...');
+        // Ticket successfully added to basket (status 200 or 201) — no console logs until data layer work completes
         
         // Wait 2 seconds before calling GetDataLayer to ensure data is ready
         await new Promise(resolve => setTimeout(resolve, 2000));
         
         // Get data layer (products added to basket)
         const dlUrl = `https://www.eticketing.co.uk/${clubName}/tagManager/GetDataLayer`;
-        console.log('[CS] Fetching data layer after 2 second delay:', dlUrl);
         let dlRes;
         try {
             dlRes = await fetch(dlUrl, {
@@ -1186,16 +1364,14 @@ ${seatDetails}
                 credentials: "include"
             });
         } catch (e) {
-            console.warn('[CS] getDataLayer fetch failed', e);
+            // silent during hot path
         }
         let dlJson = null;
         try {
             if (dlRes) dlJson = await dlRes.json();
         } catch (e) {
-            console.warn('[CS] data layer parse failed', e);
+            // silent during hot path
         }
-
-        console.log('[CS] dataLayer result', dlJson);
 
         //asyn call checkOnce function
         checkOnce().catch(e => console.error('[CS] checkOnce error after one product was added to basket', e));
@@ -1240,12 +1416,6 @@ ${seatDetails}
                 eventDate = products[0].kickoff_datetime || "Unknown Date/Time";
             }
             
-            console.log('[CS] Found product_added_to_basket event with', products.length, 'products');
-            console.log('[CS] Products with prices:', products.map(p => ({ 
-                seat: `${p.seatBlock} Row ${p.seatRow} Seat ${p.seatSeat}`, 
-                price: p.price, 
-                currency: p.currency 
-            })));
         } else {
             // Fall back to basket_viewed event if product_added_to_basket is not found
             const basketViewedEvents = dlJson.filter(item => item.event === 'basket_viewed');
@@ -1262,7 +1432,6 @@ ${seatDetails}
                     eventDate = products[0].kickoff_datetime || "Unknown Date/Time";
                 }
                 
-                console.log('[CS] Found basket_viewed event with', products.length, 'products');
             }
         }
     }
@@ -1285,8 +1454,6 @@ ${seatDetails}
     
     // Only fetch basket HTML if dataLayer is incomplete
     if (needsFallback) {
-        console.log(`[CS] DataLayer incomplete: products=${products.length}, quantity=${expectedQuantity}, fetching basket HTML`);
-        
         const basketUrl = `https://www.eticketing.co.uk/${clubName}/Checkout/Basket`;
         try {
             const basketRes = await fetch(basketUrl, {
@@ -1304,11 +1471,8 @@ ${seatDetails}
             
             if (basketRes.ok) {
                 const basketHtml = await basketRes.text();
-                console.log('[CS] basket HTML fetched successfully for fallback');
-                
                 // Parse basket HTML to get seat details
                 const basketHtmlData = parseBasketHtml(basketHtml);
-                console.log('[CS] parsed basket HTML data:', basketHtmlData);
                 
                 if (basketHtmlData.events && basketHtmlData.events.length > 0) {
                     products = basketHtmlData.events.map(event => ({
@@ -1326,24 +1490,16 @@ ${seatDetails}
                         filter_event_type: "Unknown"
                     }));
                     
-                    console.log(`[CS] Using basket HTML data: ${products.length} seats found`);
-                    
                     // Set event name and date from monitor if available
                     if (monitor.eventUrl) {
                         eventName = "Event from URL";
                         eventDate = "Unknown Date/Time";
                     }
-                } else {
-                    console.warn('[CS] No basket events found in HTML');
                 }
-            } else {
-                console.warn('[CS] basket HTML fetch failed with status:', basketRes.status);
             }
         } catch (e) {
-            console.warn('[CS] basket HTML fetch error:', e);
+            /* silent */
         }
-    } else {
-        console.log(`[CS] DataLayer complete: products=${products.length}, quantity=${expectedQuantity}, no need for basket HTML`);
     }
 
     // Build seat info with proper price formatting
@@ -1411,7 +1567,6 @@ ${seatDetails}
         });
         
         const pairCount = pairs.length;
-        console.log('[CS] Found', pairCount, 'pairs from products:', pairs);
         
         // Add pair information (always show, even if 0 pairs)
         const pairDetails = pairs.map((pair, idx) => {
@@ -1438,6 +1593,7 @@ ${pairCount > 0 ? pairDetails : 'No adjacent pairs found'}`;
 🆔 **Event ID:** ${monitor.eventId}  
 🔗 **Event URL:** ${monitor.eventUrl}  
 📍 **Area ID:** ${areaId}  
+🔢 **Quantity (monitor):** ${monitor.quantity}  
 👤 **Account:** ${userEmail}  
 📍 **Endpoint:** ${endpointType}  
             
@@ -1450,12 +1606,8 @@ ${seatInfo}${pairInfoText}
             
 ═════════════════════════════════════════════════`;
 
-    console.log('[CS] message to send:', message);
-
-    // Always send success notification when tickets are added to basket
-    console.log('[CS] Sending success webhook notification - tickets added to basket');
-    console.log('[CS] Webhook message length:', message.length);
-    console.log('[CS] Webhook payload:', dlJson);
+    const seatsHttp = seatsCheckHttpStatus != null ? seatsCheckHttpStatus : '?';
+    console.log('[CS] Ticket added to basket | Seats check: ' + seatsCheckEndpointLabel + ', HTTP ' + seatsHttp + ', quantity: ' + monitor.quantity + ' | lock/add: OK');
     
     chrome.runtime.sendMessage({
         action: 'notifyWebhooks',
@@ -1464,13 +1616,10 @@ ${seatInfo}${pairInfoText}
     }, (response) => {
         if (chrome.runtime.lastError) {
             console.error('[CS] Webhook send error:', chrome.runtime.lastError);
-        } else {
-            console.log('[CS] Webhook send response:', response);
         }
     });
 
     // Open new tab after sending success notification
-    console.log('[CS] Opening new tab with success URL');
     chrome.runtime.sendMessage({
         action: 'openNewTab',
         url: 'https://www.exampleTicketsbasketaddedinthisWindow.com'
@@ -1578,6 +1727,8 @@ async function refreshEventTabWithTracking() {
         }
     });
     const completed = await waitForEventTabReload(EVENT_TAB_RELOAD_TIMEOUT_MS);
-    if (completed) lastEventTabRefreshAt = Date.now();
+    if (!completed) {
+        lastEventTabRefreshAt = Date.now();
+    }
     return true; // always return true so caller continues to next API call (timeout or success)
 }

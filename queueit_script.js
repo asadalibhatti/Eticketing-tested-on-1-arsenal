@@ -2,6 +2,12 @@
 
 console.log("[QueueIt Script] Script loaded on:", window.location.href);
 
+/** When queue UI shows people ahead / progress, wait longer before treating reCAPTCHA as stuck or redirecting without iframe. */
+const RECAPTCHA_SOLVE_TIMEOUT_MS = 30000;
+const RECAPTCHA_SOLVE_TIMEOUT_PEOPLE_AHEAD_MS = 180000; // ~3 minutes
+const NO_RECAPTCHA_IFRAME_REDIRECT_SEC = 50;
+const NO_RECAPTCHA_IFRAME_REDIRECT_PEOPLE_AHEAD_SEC = 180; // ~3 minutes
+
 /** Returns true if the page shows \"people ahead of you\", the main queue progress bar, or the \"Your queue position will be updated in:\" warning box (user is in queue and must wait). */
 function hasPeopleAheadOfYouVisible() {
     // Check for "people ahead of you" text
@@ -40,6 +46,34 @@ function hasPeopleAheadOfYouVisible() {
     return false;
 }
 
+/**
+ * True only when #buttonConfirmVisitorPresence shows the clickable "Yes, I'm here" label (not the hidden KO template).
+ * Button `textContent` still includes "I'm here" from a `display:none` span — must check visibility.
+ */
+function isVisitorPresenceImHerePromptVisible(button) {
+    if (!button) return false;
+    const spans = button.querySelectorAll('span.l');
+    for (let i = 0; i < spans.length; i++) {
+        const sp = spans[i];
+        const raw = (sp.textContent || '').replace(/\s+/g, ' ').trim();
+        if (raw.indexOf("I'm here") === -1) continue;
+        const st = window.getComputedStyle(sp);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+        const r = sp.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        return true;
+    }
+    return false;
+}
+
+function isVisitorPresenceButtonClickable(button) {
+    if (!button) return false;
+    if (button.disabled) return false;
+    if (button.hasAttribute('disabled')) return false;
+    if (button.getAttribute('aria-disabled') === 'true') return false;
+    return true;
+}
+
 /** Send setQueueWaiting message to background every 3s so background knows we're still in queue; background clears flag if no message in 10s. */
 function sendQueueWaitingToBackground() {
     const onQueueUrl = window.location.href.startsWith('https://hd-queue.eticketing.co.uk') ||
@@ -56,6 +90,7 @@ let queueFlagEverSeen = false; // true if "people ahead" or progress bar has bee
 let joinWaitingRoomButtonClicked = false; // track if "Join waiting room" button was clicked
 let confirmRedirectButtonClicked = false; // track if "Yes, please" confirm redirect button was clicked
 let getNewPlaceInQueueClicked = false; // track if "Get a new place in the queue" link was clicked
+let confirmVisitorPresenceClicked = false; // "Yes, I'm here" (#buttonConfirmVisitorPresence)
 let captchaCodeLabelHandled = false; // track if "Enter the code from the picture" label was handled
 let browsingPausedUntil = 0; // when \"Your browsing activity has been paused\" was seen; back off actions for 60s
 
@@ -149,6 +184,19 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 }
             }
 
+            // --- Click "Yes, I'm here" visitor-presence button only when that label is visible (not hidden KO span) ---
+            const visitorPresenceBtn = document.querySelector('button#buttonConfirmVisitorPresence');
+            if (
+                visitorPresenceBtn &&
+                !confirmVisitorPresenceClicked &&
+                isVisitorPresenceButtonClickable(visitorPresenceBtn) &&
+                isVisitorPresenceImHerePromptVisible(visitorPresenceBtn)
+            ) {
+                confirmVisitorPresenceClicked = true;
+                console.log("[QueueIt Script] 'Yes, I'm here' (#buttonConfirmVisitorPresence) visible and clickable — clicking...");
+                visitorPresenceBtn.click();
+            }
+
             // --- Click "Get a new place in the queue" link as soon as it appears ---
             if (!getNewPlaceInQueueClicked) {
                 const getNewPlaceLink = Array.from(document.querySelectorAll('a.btn')).find(a => {
@@ -188,8 +236,15 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 iframeFound = true;
 
                 if (recaptchaTimeout) clearTimeout(recaptchaTimeout);
+                const recaptchaMs = hasPeopleAheadOfYouVisible()
+                    ? RECAPTCHA_SOLVE_TIMEOUT_PEOPLE_AHEAD_MS
+                    : RECAPTCHA_SOLVE_TIMEOUT_MS;
                 recaptchaTimeout = setTimeout(async () => {
-                    console.log("[QueueIt Script] reCAPTCHA not solved in 30s. Refreshing event tab...");
+                    if (hasPeopleAheadOfYouVisible()) {
+                        console.log("[QueueIt Script] reCAPTCHA timeout reached but people ahead / queue UI visible — skipping event tab refresh.");
+                        return;
+                    }
+                    console.log("[QueueIt Script] reCAPTCHA not solved in time. Refreshing event tab...");
                     clearInterval(checkElements);
 
                     chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
@@ -199,17 +254,26 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                             console.log('[CS] refreshEventTab response:', response);
                         }
                     });
-                }, 30000); // wait 30 sec after iframe appears
+                }, recaptchaMs);
             }
 
-            // --- If iframe not found within 50s, redirect to event URL ---
-            if (!iframeFound && !cookiesCleared && elapsed >= 50) {
-                cookiesCleared = true;
-                console.log("[QueueIt Script] No reCAPTCHA iframe in 50s. Redirecting to event URL...");
-                clearInterval(checkElements);
-                const { eventUrl } = await chrome.storage.local.get("eventUrl");
-                if (eventUrl) window.location.href = eventUrl;
-                return;
+            // --- If iframe not found within N seconds, redirect to event URL (longer wait while people-ahead queue UI is visible) ---
+            if (!iframeFound && !cookiesCleared) {
+                const needSec = hasPeopleAheadOfYouVisible()
+                    ? NO_RECAPTCHA_IFRAME_REDIRECT_PEOPLE_AHEAD_SEC
+                    : NO_RECAPTCHA_IFRAME_REDIRECT_SEC;
+                if (elapsed >= needSec) {
+                    if (hasPeopleAheadOfYouVisible()) {
+                        // Do not redirect away from queue while user is clearly in line
+                        return;
+                    }
+                    cookiesCleared = true;
+                    console.log("[QueueIt Script] No reCAPTCHA iframe after " + Math.round(needSec) + "s. Redirecting to event URL...");
+                    clearInterval(checkElements);
+                    const { eventUrl } = await chrome.storage.local.get("eventUrl");
+                    if (eventUrl) window.location.href = eventUrl;
+                    return;
+                }
             }
 
             // --- Handle captcha input ---

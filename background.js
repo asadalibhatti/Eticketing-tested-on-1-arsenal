@@ -5,6 +5,11 @@ let EVENT_URL = "";
 let eventTabId = null;
 let notAllowedTabId = null;
 let openOrFocusTabsInProgress = false; // prevents 2-min check from creating a second event tab while heartbeat reload runs
+/** Serializes all event-tab create/reload operations (one chain, no parallel opens). */
+let eventTabOpChain = Promise.resolve();
+let error403ResumeTimerId = null;
+/** In-memory mirror of storage `error403PauseUntil`; heartbeat / event-tab ops skip while Date.now() < this. */
+let error403PauseUntil = 0;
 
 console.log('[BG] Background loaded');
 let lastStatus = null;
@@ -15,11 +20,97 @@ let sheetUrl = "https://docs.google.com/spreadsheets/d/1uiHk8KEp-Yc5tj8l6RnY2dEG
 let lastSetQueueWaitingAt = 0;
 const QUEUE_WAITING_TIMEOUT_MS = 7000;
 const QUEUE_WAITING_CHECK_INTERVAL_MS = 3000;
+/** Upper bound for error403 backoff: 5 + 3·n minutes, capped at this value. */
+const ERROR403_MAX_WAIT_MINUTES = 45;
+
+/** Default % Resale endpoint chance when sheet column is missing (same as historical ~96% resale behaviour). */
+const DEFAULT_RESALE_ENDPOINT_CHANCES = 96;
+
+/** Sheet header normalized to `paircheckchance` (see fetchSheetConfigAll). Empty → null. */
+function parsePairCheckChanceFromSheetMap(map) {
+    const raw = map['paircheckchance'];
+    if (raw === '' || raw == null || String(raw).trim() === '') return null;
+    const v = parseFloat(String(raw).replace(/%/g, '').trim());
+    if (!Number.isFinite(v)) return null;
+    return Math.min(100, Math.max(0, v));
+}
+
+/** null → use areSeatsTogether + quantity from sheet; else roll pair (true, 2) vs single (false, 1). */
+function seatModeFromPairChance(areSeatsTogetherBool, quantityVal, pairChancePct) {
+    if (pairChancePct == null) {
+        return {
+            areSeatsTogether: !!areSeatsTogetherBool,
+            quantity: parseInt(quantityVal, 10) || 1
+        };
+    }
+    if (Math.random() * 100 < pairChancePct) {
+        return { areSeatsTogether: true, quantity: 2 };
+    }
+    return { areSeatsTogether: false, quantity: 1 };
+}
+
+function clubNameFromEventUrl(url) {
+    try {
+        const parts = (url || '').split('/');
+        return parts[3] || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+/**
+ * Push a matching sheet row into chrome.storage.local.
+ * @param {object} row - row from fetchSheetConfigAll
+ * @param {{ openingTabs: boolean }} opts - if true, apply pair-chance roll (auto-start); if false and pair chance is set, skip seats (content script owns rolls)
+ */
+async function syncSheetRowToStorage(row, opts) {
+    const openingTabs = opts && opts.openingTabs === true;
+    let seatInit = null;
+    if (openingTabs) {
+        seatInit = seatModeFromPairChance(row.areSeatsTogether, row.quantity, row.pairCheckChance);
+    } else if (row.pairCheckChance == null) {
+        seatInit = seatModeFromPairChance(row.areSeatsTogether, row.quantity, null);
+    }
+    const payload = {
+        currentStatus: 'on',
+        eventUrl: row.eventUrl,
+        startSecond: row.startSecond,
+        discordWebhook: (row.discordWebhook || '').trim(),
+        telegramWebhook: (row.telegramWebhook || '').trim(),
+        telegramChatId: row.telegramChatId != null && String(row.telegramChatId).trim() !== '' ? String(row.telegramChatId).trim() : '',
+        eventId: row.eventId,
+        maximumPrice: row.maximumPrice,
+        minimumPrice: row.minimumPrice,
+        loginEmail: row.loginEmail,
+        loginPassword: row.loginPassword,
+        ignoreClubLevel: row.ignoreClubLevel,
+        ignoreUpperTier: row.ignoreUpperTier,
+        resaleEndpointChances: row.resaleEndpointChances != null ? row.resaleEndpointChances : DEFAULT_RESALE_ENDPOINT_CHANCES
+    };
+    if (seatInit) {
+        payload.areSeatsTogether = seatInit.areSeatsTogether;
+        payload.quantity = seatInit.quantity;
+    }
+    await chrome.storage.local.set(payload);
+}
 
 // On extension/background start, clear the flag so we never start with a stale true from a previous session
 lastSetQueueWaitingAt = 0;
 chrome.storage.local.set({ inQueueWaiting: false });
 console.log('[BG] Queue waiting flag cleared on start');
+
+/** Clear 403 pause timer, counts, and storage so reload / sheet-on never inherits stale queue-403 state. */
+async function resetError403State(reason) {
+    if (error403ResumeTimerId != null) {
+        clearTimeout(error403ResumeTimerId);
+        error403ResumeTimerId = null;
+    }
+    error403PauseUntil = 0;
+    await chrome.storage.local.set({ error403PauseUntil: 0, error403Count: 0 });
+    console.log('[BG] error403 state reset:', reason || '(no reason)');
+}
+
+void resetError403State('extension / background started');
 
 async function checkQueueWaitingTimeout() {
     if (!lastSetQueueWaitingAt) return;
@@ -111,55 +202,20 @@ async function pollSheetAndControl() {
         const currentStatus = anyMatch ? 'on' : 'off';
 
         if (currentStatus !== lastStatus) {
+            const previousStatus = lastStatus;
             console.log(`[BG] Status changed: ${lastStatus} -> ${currentStatus}`);
             lastStatus = currentStatus;
 
             if (anyMatch) {
+                if (previousStatus !== 'on') {
+                    await resetError403State('Google Sheet status turned on (was off or unset)');
+                }
                 console.log('[BG] Auto-start triggered for matching rows');
                 for (const row of matchingRows) {
                     console.log('[BG] Opening tabs for', row.eventUrl);
-                    // {
-                    //     "status": "on",
-                    //     "discordWebhook": "https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br",
-                    //     "telegramWebhook": "123456789:ABCDEFghijkLmnoPQrstUVwxYZ",
-                    //     "telegramChatId": 987654321,
-                    //     "eventUrl": "https://www.eticketing.co.uk/arsenal/EDP/Event/Index/3674",
-                    //     "areSeatsTogether": "false",
-                    //     "quantity": 1,
-                    //     "startSecond": 2,
-                    //     "eventId": 3674,
-                    //     "maximumPrice": 10000000,
-                    //     "minimumPrice": ""
-                    // }
-
-
-                    //save to local storage currentStatus
-                    await chrome.storage.local.set({
-                        currentStatus: currentStatus,
-                        eventUrl: row.eventUrl,
-                        startSecond: row.startSecond,
-                        areSeatsTogether: row.areSeatsTogether === 'true', // convert to boolean
-                        quantity: parseInt(row.quantity, 10) || 1,
-                        discordWebhook: row.discordWebhook,
-                        telegramWebhook: row.telegramWebhook,
-                        telegramChatId: row.telegramChatId,
-                        eventId: row.eventId,
-                        maximumPrice: row.maximumPrice,
-                        minimumPrice: row.minimumPrice,
-                        loginEmail: row.loginEmail,
-                        loginPassword: row.loginPassword,
-                        ignoreClubLevel: row.ignoreClubLevel,
-                        ignoreUpperTier: row.ignoreUpperTier
-                    });
+                    await syncSheetRowToStorage(row, { openingTabs: true });
                     EVENT_URL = row.eventUrl;
-
-                    function getClubName(url) {
-                        const parts = url.split('/');
-                        return parts[3]; // the club name is the 4th part in the URL array
-                    }
-
-                    const clubName = getClubName(EVENT_URL);
-                    // "https://www.eticketing.co.uk/clubname/EDP/Validation/EventNotAllowed?eventId=4&reason=EventArchived";
+                    const clubName = clubNameFromEventUrl(EVENT_URL);
                     EVENT_NOT_ALLOWED_URL = `https://www.eticketing.co.uk/${clubName}/EDP/Validation/EventNotAllowed?eventId=4&reason=EventArchived`;
                     await openOrFocusTabs(EVENT_URL, EVENT_NOT_ALLOWED_URL);
                 }
@@ -168,6 +224,19 @@ async function pollSheetAndControl() {
 
 
                 notifyTabStop();
+            }
+        } else if (anyMatch && matchingRows.length > 0) {
+            // Status already "on": still push latest sheet row to storage so EventUrl / webhooks / credentials update without toggling status
+            const row = matchingRows[0];
+            await syncSheetRowToStorage(row, { openingTabs: false });
+            const nu = (row.eventUrl || '').trim();
+            if (nu && nu !== (EVENT_URL || '').trim()) {
+                EVENT_URL = nu;
+                const clubName = clubNameFromEventUrl(EVENT_URL);
+                EVENT_NOT_ALLOWED_URL = `https://www.eticketing.co.uk/${clubName}/EDP/Validation/EventNotAllowed?eventId=4&reason=EventArchived`;
+                console.log('[BG] Sheet poll: synced row to storage; eventUrl updated for background helpers');
+            } else {
+                console.log('[BG] Sheet poll: synced row to storage (eventUrl unchanged or empty)');
             }
         }
         // no need for below code as heart beat is already handling this
@@ -357,8 +426,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const detectedAt = new Date();
         console.log('[BG] error403 detected at', detectedAt.toLocaleTimeString(), '- scheduling pause then resume (open/reload tabs).');
         (async () => {
+            if (error403ResumeTimerId != null) {
+                clearTimeout(error403ResumeTimerId);
+                error403ResumeTimerId = null;
+                console.log('[BG] error403: cleared previous resume timer (single resume only)');
+            }
             const { error403Count = 0 } = await chrome.storage.local.get('error403Count');
-            const waitMinutes = 5 + (error403Count * 3); // 5, 8, 11, 14... min
+            const waitMinutes = Math.min(ERROR403_MAX_WAIT_MINUTES, 5 + (error403Count * 3)); // 5, 8, … min, max 45
             await chrome.storage.local.set({ error403Count: error403Count + 1 });
             const waitMs = waitMinutes * 60 * 1000;
             const pauseUntil = Date.now() + waitMs;
@@ -366,7 +440,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             error403PauseUntil = pauseUntil; // pause heartbeat reload until our resume runs
             await chrome.storage.local.set({ error403PauseUntil: pauseUntil }); // so content script can pause seat checks
             console.log(`[BG] error403: detected at ${detectedAt.toLocaleTimeString()}; occurrence #${error403Count + 1}, will resume at ${resumeAt.toLocaleTimeString()} (${waitMinutes} min wait); heartbeat and seat checks paused until then.`);
-            setTimeout(async () => {
+            error403ResumeTimerId = setTimeout(async () => {
+                error403ResumeTimerId = null;
                 const resumingAt = new Date();
                 error403PauseUntil = 0;
                 await chrome.storage.local.set({ error403PauseUntil: 0 }); // resume seat checks in validation tab
@@ -393,6 +468,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 }
                 if (!sheetStatusOn) {
                     console.log('[BG] error403 resume: sheet status is Off - not opening/reloading tabs.');
+                    notifyValidationTabError403Resume();
                     return;
                 }
                 if (!eventUrl) {
@@ -403,8 +479,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 EVENT_URL = eventUrl;
                 await chrome.storage.local.set({ inQueueWaiting: false });
                 lastSetQueueWaitingAt = 0;
-                console.log('[BG] error403 resume: sheet status On - refreshing event tab only.');
-                await refreshEventTab();
+                console.log('[BG] error403 resume: sheet status On — ensure event tab (respects queue / no dupes).');
+                await ensureEventTabFromBackground(eventUrl, { forceReload: true });
                 notifyValidationTabError403Resume(); // tell validation tab to resume seat check instantly
                 console.log("[BG] error403 resume done; heartbeat reset to initial 3-minute cycle.");
             }, waitMs);
@@ -484,17 +560,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.log('[BG] Message length:', msg.message ? msg.message.length : 0);
 
         // Use promise chaining instead of await
-        chrome.storage.local.get(['discordWebhook', 'telegramWebhook']).then(data => {
+        chrome.storage.local.get(['discordWebhook', 'telegramWebhook', 'telegramChatId']).then(data => {
             const discordWebhook = data.discordWebhook || '';
             const telegramWebhook = data.telegramWebhook || '';
+            const telegramChatId = data.telegramChatId != null && data.telegramChatId !== '' ? String(data.telegramChatId).trim() : '';
             const payload = msg.payload || {};
             const message = msg.message || 'Notification from Arsenal Tickets Extension';
 
-            console.log('[BG] Webhook config:', {discordWebhook: !!discordWebhook, telegramWebhook: !!telegramWebhook});
+            console.log('[BG] Webhook config:', { discordWebhook: !!discordWebhook, telegramBotToken: !!telegramWebhook, telegramChatId: !!telegramChatId });
 
             // Always send success notification: default Discord webhook + sheet webhook if provided
             console.log('[BG] Sending webhooks...');
-            sendWebhooks(discordWebhook, telegramWebhook, message, payload);
+            sendWebhooks(discordWebhook, telegramWebhook, telegramChatId, message, payload);
         }).catch(err => {
             console.error('[BG] Error reading webhooks config:', err);
         });
@@ -587,8 +664,12 @@ async function refreshCredentialsFromSheet() {
         loginEmail: cfg.loginEmail,
         loginPassword: cfg.loginPassword,
         currentStatus: 'on',
+        discordWebhook: (cfg.discordWebhook || '').trim(),
+        telegramWebhook: (cfg.telegramWebhook || '').trim(),
+        telegramChatId: cfg.telegramChatId != null && String(cfg.telegramChatId).trim() !== '' ? String(cfg.telegramChatId).trim() : '',
         ignoreClubLevel: cfg.ignoreClubLevel,
-        ignoreUpperTier: cfg.ignoreUpperTier
+        ignoreUpperTier: cfg.ignoreUpperTier,
+        resaleEndpointChances: cfg.resaleEndpointChances != null ? cfg.resaleEndpointChances : DEFAULT_RESALE_ENDPOINT_CHANCES
     });
 
     console.log('[BG] Credentials updated in local storage');
@@ -629,17 +710,22 @@ async function startFlowFromStorage() {
             //     "minimumPrice": ""
             //     }
             // Save to local storage
+            const seatCfg = seatModeFromPairChance(cfg.areSeatsTogether, cfg.quantity, cfg.pairCheckChance);
             await chrome.storage.local.set({
                 sheetUrl: sheetUrl,
                 startSecond: cfg.startSecond,
                 currentStatus: 'on', // set currentStatus to 'on'
                 eventUrl: cfg.eventUrl,
-                areSeatsTogether: cfg.areSeatsTogether === 'true', // convert to boolean
-                quantity: parseInt(cfg.quantity, 10) || 1,
+                areSeatsTogether: seatCfg.areSeatsTogether,
+                quantity: seatCfg.quantity,
+                discordWebhook: (cfg.discordWebhook || '').trim(),
+                telegramWebhook: (cfg.telegramWebhook || '').trim(),
+                telegramChatId: cfg.telegramChatId != null && String(cfg.telegramChatId).trim() !== '' ? String(cfg.telegramChatId).trim() : '',
                 loginEmail: cfg.loginEmail,
                 loginPassword: cfg.loginPassword,
                 ignoreClubLevel: cfg.ignoreClubLevel,
-                ignoreUpperTier: cfg.ignoreUpperTier
+                ignoreUpperTier: cfg.ignoreUpperTier,
+                resaleEndpointChances: cfg.resaleEndpointChances != null ? cfg.resaleEndpointChances : DEFAULT_RESALE_ENDPOINT_CHANCES
             });
 
             await openOrFocusTabs(cfg.eventUrl, EVENT_NOT_ALLOWED_URL);
@@ -648,6 +734,10 @@ async function startFlowFromStorage() {
 }
 
 async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
+    if (openOrFocusTabsInProgress) {
+        console.log('[BG] openOrFocusTabs already running - skip duplicate call');
+        return;
+    }
     if (Date.now() < error403PauseUntil) {
         console.log('[BG] error403 pause active - skipping openOrFocusTabs.');
         return;
@@ -702,38 +792,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
 
         // Handle Event tab only if eventUrl is provided
         if (eventUrl) {
-            const foundEventTab = tabs.find(t => t.url && t.url.startsWith(eventUrl));
-            console.log("checking here")
-            if (foundEventTab) {
-                console.log('[BG] Found existing event tab, reloading', foundEventTab.id);
-                eventTabId = foundEventTab.id;
-                const tab = await chrome.tabs.get(eventTabId);
-
-// bring the window to front
-                await chrome.windows.update(tab.windowId, {focused: true});
-// make tab active in its window
-                await chrome.tabs.update(tab.id, {active: true});
-// reload the tab
-                await chrome.tabs.reload(tab.id);
-
-
-
-
-
-
-            } else {
-                const created = await chrome.tabs.create({url: eventUrl, active: false});
-
-// make the new tab active
-                await chrome.tabs.update(created.id, {active: true});
-
-// bring its window to the front
-                await chrome.windows.update(created.windowId, {focused: true});
-
-                console.log('[BG] Created event tab', created.id);
-                eventTabId = created.id;
-
-            }
+            await ensureEventTabFromBackground(eventUrl, { forceReload: true });
             // Wait before opening validation tab (after event tab)
             await new Promise(resolve => setTimeout(resolve, 50000)); // 50 seconds
 
@@ -785,23 +844,7 @@ async function openOrFocusTabs(eventUrl = null, EVENT_NOT_ALLOWED_URL = null) {
         const tabs2 = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
 
         if (eventUrl) {
-            const stillEvent = tabs2.some(t => t.url && t.url.startsWith(eventUrl));
-            if (!stillEvent) {
-                console.log('[BG] Event tab closed, reopening...');
-
-                const created = await chrome.tabs.create({url: eventUrl, active: false});
-// bring its window to the front
-                await chrome.windows.update(created.windowId, {focused: true});
-
-// make the new tab active
-                await chrome.tabs.update(created.id, {active: true});
-
-
-
-                eventTabId = created.id;
-
-            }
-            //wait for 5 seconds here
+            await ensureEventTabFromBackground(eventUrl, { forceReload: true });
             await new Promise(resolve => setTimeout(resolve, 30000));
         }
         // check if queue or web identity tabs still there
@@ -906,6 +949,137 @@ const ETICKETING_HOST = 'www.eticketing.co.uk';
 const QUEUE_HOST = 'hd-queue.eticketing.co.uk';
 const ARSENAL_HOST = 'www.arsenal.com';
 
+function eventIdFromEticketEventUrl(url) {
+    if (!url) return null;
+    const m = url.match(/\/Event\/Index\/(\d+)/i);
+    if (m) return m[1];
+    const m2 = url.match(/[?&]EventId=(\d+)/i);
+    return m2 ? m2[1] : null;
+}
+
+function tabIsOurEticketEventPage(tab, eventUrl) {
+    const u = tab.url || '';
+    if (!eventUrl || !u) return false;
+    return u.startsWith(eventUrl.split('?')[0]);
+}
+
+/** Queue tab still “owns” the event flow if `t=` target points at our event. */
+function tabIsOurQueueSlotForEvent(tab, eventUrl) {
+    const u = tab.url || '';
+    if (!u || !eventUrl) return false;
+    const host = (() => {
+        try {
+            return new URL(u).hostname.toLowerCase();
+        } catch (_) {
+            return '';
+        }
+    })();
+    if (host !== QUEUE_HOST) return false;
+    const eventId = eventIdFromEticketEventUrl(eventUrl);
+    try {
+        const parsed = new URL(u);
+        const t = parsed.searchParams.get('t');
+        if (t) {
+            const decoded = decodeURIComponent(t);
+            if (decoded.startsWith(eventUrl.split('?')[0])) return true;
+            if (eventId && (decoded.includes(`EventId=${eventId}`) || decoded.includes(`/Event/Index/${eventId}`))) return true;
+        }
+    } catch (_) {}
+    return false;
+}
+
+async function shouldSkipEventTabOperations() {
+    if (Date.now() < error403PauseUntil) {
+        console.log('[BG] Event tab op skipped — error403 pause (memory)');
+        return true;
+    }
+    const { error403PauseUntil: storedUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
+    const until = Number(storedUntil) || 0;
+    if (until > 0 && Date.now() < until) {
+        console.log('[BG] Event tab op skipped — error403 pause (storage)');
+        return true;
+    }
+    await checkQueueWaitingTimeout();
+    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+    if (inQueueWaiting) {
+        console.log('[BG] Event tab op skipped — inQueueWaiting (people ahead)');
+        return true;
+    }
+    return false;
+}
+
+async function focusTabWindow(tabId) {
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        await chrome.windows.update(tab.windowId, { focused: true });
+        await chrome.tabs.update(tabId, { active: true });
+    } catch (e) {
+        console.warn('[BG] focusTabWindow failed', tabId, e);
+    }
+}
+
+function runExclusiveEventTabOp(fn) {
+    const run = eventTabOpChain.then(() => fn());
+    eventTabOpChain = run.then(() => {}).catch((e) => console.warn('[BG] Event tab chain error', e));
+    return run;
+}
+
+/**
+ * Single entry for event tab: reload www match, or recognize hd-queue as same flow (no duplicate tab), or create.
+ * @param {string} eventUrlParam
+ * @param {{ forceReload?: boolean }} opts
+ */
+async function ensureEventTabFromBackground(eventUrlParam, opts) {
+    const forceReload = opts && opts.forceReload === true;
+    return runExclusiveEventTabOp(async () => {
+        if (await shouldSkipEventTabOperations()) {
+            return { success: false, skipped: true, message: 'queue or error403 pause' };
+        }
+        let url = (eventUrlParam || EVENT_URL || '').trim();
+        if (!url) {
+            const st = await chrome.storage.local.get('eventUrl');
+            url = (st.eventUrl || '').trim();
+        }
+        if (!url) {
+            console.warn('[BG] ensureEventTab: no event URL');
+            return { success: false, message: 'no eventUrl' };
+        }
+        EVENT_URL = url;
+
+        const allTabs = await chrome.tabs.query({});
+        const wwwTab = allTabs.find((t) => tabIsOurEticketEventPage(t, url));
+        if (wwwTab) {
+            eventTabId = wwwTab.id;
+            if (forceReload) {
+                try {
+                    await chrome.tabs.reload(wwwTab.id);
+                    console.log('[BG] ensureEventTab: reloaded existing event tab', wwwTab.id);
+                } catch (e) {
+                    console.warn('[BG] ensureEventTab reload failed', e);
+                }
+            } else {
+                console.log('[BG] ensureEventTab: using existing www event tab', wwwTab.id);
+            }
+            await focusTabWindow(wwwTab.id);
+            return { success: true, action: forceReload ? 'reloaded' : 'found-www' };
+        }
+
+        const queueTab = allTabs.find((t) => tabIsOurQueueSlotForEvent(t, url));
+        if (queueTab) {
+            eventTabId = queueTab.id;
+            console.log('[BG] ensureEventTab: event flow on queue tab — not creating another', queueTab.id);
+            await focusTabWindow(queueTab.id);
+            return { success: true, action: 'queue-holds-slot' };
+        }
+
+        const created = await chrome.tabs.create({ url, active: false });
+        eventTabId = created.id;
+        console.log('[BG] ensureEventTab: created new event tab', created.id);
+        await focusTabWindow(created.id);
+        return { success: true, action: 'created' };
+    });
+}
+
 function tabUrlIsManagedHost(url) {
     if (!url) return false;
     try {
@@ -978,70 +1152,31 @@ async function notifyValidationTabError403Resume() {
  */
 async function checkEventTabAndCreateIfMissing() {
     if (lastStatus !== 'on') return;
-    const pausedForError403 = Date.now() < error403PauseUntil;
+    const { error403PauseUntil: stored403 = 0 } = await chrome.storage.local.get('error403PauseUntil');
+    const until403 = Number(stored403) || 0;
+    const pausedForError403 = Date.now() < error403PauseUntil || (until403 > 0 && Date.now() < until403);
     const { eventUrl, inQueueWaiting } = await chrome.storage.local.get(['eventUrl', 'inQueueWaiting']);
-    if (eventUrl && !inQueueWaiting && !pausedForError403 && !openOrFocusTabsInProgress) {
-        const tabs = await chrome.tabs.query({ url: '*://www.eticketing.co.uk/*' });
-        const eventTabExists = tabs.some(t => t.url && t.url.startsWith(eventUrl));
-        if (!eventTabExists) {
-            EVENT_URL = eventUrl;
-            console.log('[BG] Event tab missing (2-min check), creating via refreshEventTab');
-            await refreshEventTab();
-        }
+    if (!eventUrl || inQueueWaiting || pausedForError403 || openOrFocusTabsInProgress) {
+        await closeOtherEticketingTabs();
+        return;
+    }
+    const allTabs = await chrome.tabs.query({});
+    const base = eventUrl.split('?')[0];
+    const hasWww = allTabs.some((t) => t.url && t.url.startsWith(base));
+    const hasQueue = allTabs.some((t) => tabIsOurQueueSlotForEvent(t, eventUrl));
+    if (!hasWww && !hasQueue) {
+        EVENT_URL = eventUrl;
+        console.log('[BG] Event tab missing (2-min check) — ensureEventTabFromBackground');
+        await ensureEventTabFromBackground(eventUrl, { forceReload: false });
     }
     await closeOtherEticketingTabs();
 }
 
+/** Public name kept for messages; all work goes through ensureEventTabFromBackground (serialized). */
 async function refreshEventTab() {
-    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
-    if (inQueueWaiting) {
-        console.log('[BG] inQueueWaiting is set - skipping refreshEventTab (user in queue).');
-        return { success: false, message: 'In queue, skipped' };
-    }
-    console.warn('[BG] refreshEventTab trying to find eventTab with event url');
-    const tabs = await chrome.tabs.query({url: '*://www.eticketing.co.uk/*'});
-    const eventTabs = tabs.filter(tab => tab.url.includes('EDP/Event/Index/'));
-
-    if (eventTabs.length === 0) {
-        console.warn('[BG] refreshEventTab: no event tab found, opening new one');
-
-        // Create new tab with EVENT_URL
-        const created = await chrome.tabs.create({url: EVENT_URL, active: false});
-        eventTabId = created.id;
-
-        // bring the window to front
-        await chrome.windows.update(created.windowId, {focused: true});
-        // make tab active in its window
-        await chrome.tabs.update(created.id, {active: true});
-
-        console.log(`[BG] Created new event tab with id ${eventTabId}`);
-    } else {
-        // refresh the found first tab
-        const existingTab = eventTabs[0];
-        eventTabId = existingTab.id;
-        console.log(`[BG] Found existing event tab with id ${eventTabId}`);
-
-        // close the event tab
-        await chrome.tabs.remove(eventTabId);
-        console.log(`[BG] Closed existing event tab with id ${eventTabId}`);
-
-        // wait 1s before recreating
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // recreate the event tab
-        const created = await chrome.tabs.create({url: EVENT_URL, active: false});
-        eventTabId = created.id;
-
-        // bring the window to front
-        await chrome.windows.update(created.windowId, {focused: true});
-        // make tab active in its window
-        await chrome.tabs.update(created.id, {active: true});
-
-        console.log(`[BG] Re-created event tab with id ${eventTabId}`);
-    }
-
-    console.log('[BG] refreshEventTab completed');
-    return {success: true, message: 'Event tab refreshed'};
+    const { eventUrl } = await chrome.storage.local.get('eventUrl');
+    const u = (EVENT_URL || eventUrl || '').trim();
+    return ensureEventTabFromBackground(u || eventUrl, { forceReload: true });
 }
 
 
@@ -1088,9 +1223,9 @@ async function fetchSheetConfigAll(sheetUrl) {
         // }
         return {
             status: (map['status'] || '').toString().toLowerCase(),
-            discordWebhook: map['discordwebhookurl'] || '',
-            telegramWebhook: map['telegrambottoken'] || '',
-            telegramChatId: map['telegramchatid'] || '',
+            discordWebhook: map['discordwebhookurl'] || map['discordwebhook'] || '',
+            telegramWebhook: map['telegrambottoken'] || map['telegramwebhook'] || map['telegramtoken'] || '',
+            telegramChatId: map['telegramchatid'] || map['telegramchat'] || '',
             eventUrl: map['eventurl'] || '',
             areSeatsTogether: String(map['areseatstogether']).toLowerCase() === 'true',
             quantity: parseInt(map['quantity'] || '1', 10),
@@ -1101,7 +1236,15 @@ async function fetchSheetConfigAll(sheetUrl) {
             loginEmail: map['loginemail'] || '',
             loginPassword: map['loginpassword'] || '',
             ignoreClubLevel: map['ignoreclublevel'] || '',
-            ignoreUpperTier: map['ignoreuppertier'] || ''
+            ignoreUpperTier: map['ignoreuppertier'] || '',
+            resaleEndpointChances: (() => {
+                const raw = map['resaleendpointchances'];
+                if (raw === '' || raw == null) return null;
+                const v = parseFloat(String(raw).replace(/%/g, '').trim());
+                if (!Number.isFinite(v)) return null;
+                return Math.min(100, Math.max(0, v));
+            })(),
+            pairCheckChance: parsePairCheckChanceFromSheetMap(map)
         };
     });
 
@@ -1167,10 +1310,13 @@ async function sendErrorWebhook(errorWebhook, message, payload) {
     console.log('[BG] sendErrorWebhook', {errorWebhook, message});
     try {
         if (errorWebhook) {
+            const separator = '\n\n────────────────────────────────────────';
+            const msg = String(message || '');
+            const content = msg.endsWith(separator) ? msg : (msg + separator);
             await fetch(errorWebhook, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({content: message, embeds: []})
+                body: JSON.stringify({content, embeds: []})
             });
             console.log('[BG] error webhook sent to:', errorWebhook);
         }
@@ -1183,10 +1329,13 @@ async function sendErrorWebhook(errorWebhook, message, payload) {
 // If Google Sheet uses the same URL, we still send exactly once (no duplicates, no missing notifications).
 const DEFAULT_SUCCESS_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1371776918407483403/i0PZw3JR5Ypuw1bmoYrPGrbf9US4eXD8S1W-FSEarQ0EvVWn2iX8VIXRyzgBcQ96S1br';
 
-async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
+async function sendWebhooks(discordWebhook, telegramBotToken, telegramChatId, message, payload) {
+    const botToken = (telegramBotToken || '').trim();
+    const chatId = telegramChatId != null && String(telegramChatId).trim() !== '' ? String(telegramChatId).trim() : '';
     console.log('[BG] sendWebhooks called', {
         discordWebhook: !!discordWebhook,
-        telegramWebhook: !!telegramWebhook,
+        telegramBotToken: !!botToken,
+        telegramChatId: !!chatId,
         messageLength: message.length
     });
     const discordBody = JSON.stringify({content: message, embeds: []});
@@ -1210,30 +1359,27 @@ async function sendWebhooks(discordWebhook, telegramWebhook, message, payload) {
             console.warn('[BG] Discord webhook send failed for', url, e);
         }
     }
-    try {
-        if (telegramWebhook) {
-            // Try POST with JSON first, else GET fallback
-            let ok = false;
-            try {
-                await fetch(telegramWebhook, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text: message})
-                });
-                ok = true;
-                console.log('[BG] telegram POST sent');
-            } catch (e) {
-                console.warn('[BG] telegram POST failed, trying GET fallback', e);
+    if (botToken && chatId) {
+        try {
+            const maxLen = 4090;
+            const text = message.length > maxLen ? message.slice(0, maxLen) + '\n…' : message;
+            const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body.ok === false) {
+                console.warn('[BG] Telegram sendMessage failed', res.status, body.description || body);
+            } else {
+                console.log('[BG] Telegram sendMessage ok');
             }
-            if (!ok) {
-                // GET fallback
-                const url = telegramWebhook.includes('?') ? `${telegramWebhook}&text=${encodeURIComponent(message)}` : `${telegramWebhook}?text=${encodeURIComponent(message)}`;
-                await fetch(url);
-                console.log('[BG] telegram GET sent');
-            }
+        } catch (e) {
+            console.warn('[BG] telegram send failed', e);
         }
-    } catch (e) {
-        console.warn('[BG] telegram send failed', e);
+    } else if (botToken || chatId) {
+        console.log('[BG] Telegram skipped — need both TelegramBotToken and TelegramChatID in sheet (one is empty).');
     }
 }
 
@@ -1245,7 +1391,6 @@ const SUBSEQUENT_HEARTBEAT_TIMEOUT = 120000; // 2 minutes for subsequent heartbe
 let lastHeartbeat = null; // store last heartbeat timestamp
 let isFirstHeartbeat = true; // track if this is the first heartbeat received
 let heartbeatMonitoringPaused = false; // track if heartbeat monitoring is paused
-let error403PauseUntil = 0; // timestamp (ms) until which heartbeat reload is skipped; set when error403 wait is active
 
 // Call this whenever you receive a heartbeat
 function updateHeartbeat() {
