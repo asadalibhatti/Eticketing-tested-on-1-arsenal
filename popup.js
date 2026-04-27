@@ -1,5 +1,6 @@
 const sheetUrlInput = document.getElementById('sheetUrl');
 const startSecondInput = document.getElementById('startSecond');
+const twoCaptchaApiKeyInput = document.getElementById('twoCaptchaApiKey');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 
@@ -8,7 +9,11 @@ const DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1uiHk8KEp-Yc5t
 
 // Load saved values on popup open
 document.addEventListener('DOMContentLoaded', async () => {
-  const { sheetUrl, startSecond } = await chrome.storage.local.get(['sheetUrl', 'startSecond']);
+  const { sheetUrl, startSecond, twoCaptchaApiKey } = await chrome.storage.local.get([
+    'sheetUrl',
+    'startSecond',
+    'twoCaptchaApiKey'
+  ]);
   
   // Set default sheet URL if none exists, otherwise use saved value
   if (sheetUrl) {
@@ -20,6 +25,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   
   if (startSecond != null && startSecond !== '') startSecondInput.value = String(startSecond).replace(',', '.');
+  if (twoCaptchaApiKey) twoCaptchaApiKeyInput.value = String(twoCaptchaApiKey);
+});
+
+twoCaptchaApiKeyInput.addEventListener('blur', async () => {
+  await chrome.storage.local.set({ twoCaptchaApiKey: twoCaptchaApiKeyInput.value.trim() });
 });
 
 startBtn.addEventListener('click', async () => {
@@ -29,7 +39,8 @@ startBtn.addEventListener('click', async () => {
   if (!sheetUrl) return alert('Enter sheet URL');
   if (Number.isNaN(startSecond)) return alert('Start Second must be a number (e.g. 2 or 2.5)');
 
-  await chrome.storage.local.set({ sheetUrl, startSecond, manualStart: true });
+  const twoCaptchaApiKey = twoCaptchaApiKeyInput.value.trim();
+  await chrome.storage.local.set({ sheetUrl, startSecond, twoCaptchaApiKey, manualStart: true });
   chrome.runtime.sendMessage({ action: 'manualStart' });
 });
 

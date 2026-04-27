@@ -78,6 +78,23 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
                 // Signal to content script that event tab has loaded and verification token is ready (so next seat API can run)
                 chrome.storage.local.set({ eventTabReloaded: true });
                 console.log("[CS] Event tab reload flag set (eventTabReloaded=true) — page loaded with token.");
+                chrome.runtime.sendMessage({ action: 'scheduleCloseEventTabAfterToken', delayMs: 5000 }, () => {
+                    if (chrome.runtime.lastError) {
+                        console.warn('[CS] scheduleCloseEventTabAfterToken:', chrome.runtime.lastError.message);
+                    } else {
+                        console.log('[CS] Background will close this event tab in 5s to save memory (re-opened when needed).');
+                    }
+                });
+                // End any active 403 pause immediately when event tab is verifiably ready.
+                chrome.runtime.sendMessage({ action: 'eventTabReloadedClear403Pause' }, (resp) => {
+                    if (chrome.runtime.lastError) {
+                        console.warn('[CS] eventTabReloadedClear403Pause message failed:', chrome.runtime.lastError.message);
+                        return;
+                    }
+                    if (resp && resp.wasPaused) {
+                        console.log('[CS] Cleared active error403 pause early because event tab token is ready.');
+                    }
+                });
 
                 // ----------------------
                 // Extract email (at same time as token)
