@@ -1,6 +1,6 @@
 console.log('TICKET Checking content script loaded on', location.href);
 
-// When event page loads (e.g. after queue or error403 resume), reset BG error403Count so the next queue error403 pause uses n=0 (5 min base in 5+3·n capped at 30).
+// When event page loads (e.g. after queue or error403 resume), reset BG error403Count so the next hd-queue /error403 pause uses n=0 (5 min base in 5+2·n min capped at 30).
 (async () => {
     const { eventUrl } = await chrome.storage.local.get('eventUrl');
     const current = (location.href || '').split('?')[0];
@@ -9,27 +9,86 @@ console.log('TICKET Checking content script loaded on', location.href);
         chrome.runtime.sendMessage({ action: 'resetError403Count' }, () => {
             if (!chrome.runtime.lastError) console.log('[CS] Event URL loaded - reset queue error403Count to 0');
         });
+        // Membership recovery ended successfully on event page
+        chrome.storage.local.set({ hdQueueMembershipRecoveryActive: false });
     }
 })();
 
-if (document.title.includes("Your Browsing Activity Has")) {
-    console.log("[CS] Waiting for tab title to change...");
-    let checkTitleInterval = setInterval(() => {
-        if (!document.title.includes("Your Browsing Activity has")) {
-            clearInterval(checkTitleInterval);
-            console.log("[CS] Tab title changed. Proceeding with verification token extraction.");
-        } else {
-            console.log("[CS] Still waiting for tab title to change...");
-        }
-    }, 1000);
+/**
+ * After Arsenal Red JOIN NOW, if we land on Memberships/List while event-open-via-membership is active,
+ * navigate this same tab to stored eventUrl so normal event-tab flow resumes.
+ */
+(async function redirectMembershipsListToEventUrlIfRecovery() {
+    try {
+        const href = location.href || '';
+        const lower = href.toLowerCase();
+        if (!lower.includes('/arsenal/memberships/list')) return;
 
-    setTimeout(() => {
-        if (document.title.includes("Your Browsing Activity has")) {
-            console.warn("[CS] Tab title did not change within 10 seconds. Reloading the page...");
-            window.location.reload();
+        const st = await chrome.storage.local.get(['hdQueueMembershipRecoveryActive', 'eventUrl']);
+        if (st.hdQueueMembershipRecoveryActive !== true) {
+            console.log('[CS] Memberships/List — event-via-membership flag not set; leaving page as-is');
+            return;
         }
-    }, 60000);
+        const eventUrl = (st.eventUrl || '').trim();
+        if (!eventUrl) {
+            console.warn('[CS] Memberships/List during membership→event open but no eventUrl in storage');
+            return;
+        }
+        console.log('[CS] Memberships/List — navigating same tab to eventUrl:', eventUrl);
+        await chrome.storage.local.set({ hdQueueMembershipRecoveryActive: false });
+        window.location.replace(eventUrl);
+    } catch (e) {
+        console.warn('[CS] redirectMembershipsListToEventUrlIfRecovery error:', e);
+    }
+})();
+
+const BROWSING_PAUSE_WAIT_MS = 60000;
+let __etkBrowsingPauseRecoveryStarted = false;
+
+/** Title or page body shows Chrome/eticketing "Your Browsing Activity Has Been Paused". */
+function isBrowsingActivityPausedOnPage() {
+    const title = (document.title || '').toLowerCase();
+    if (title.includes('your browsing activity')) return true;
+    try {
+        const bodyText = (document.body && (document.body.innerText || document.body.textContent) || '').toLowerCase();
+        if (bodyText.includes('your browsing activity has been paused')) return true;
+        if (bodyText.includes('your browsing activity has')) return true;
+    } catch (_) {}
+    return false;
 }
+
+/**
+ * Notify background to run shared 60s → reload / after 3 → clear-cookies recovery.
+ * Content does not reload itself (avoids double-counting with BG title poll).
+ * Returns true if pause was present (caller should not start seat checks yet).
+ */
+function startBrowsingActivityPauseRecoveryIfNeeded() {
+    if (!isBrowsingActivityPausedOnPage()) return false;
+    if (__etkBrowsingPauseRecoveryStarted) return true;
+    __etkBrowsingPauseRecoveryStarted = true;
+    console.warn(
+        `[CS] Browsing activity paused — notifying background (60s→reload; after 3→clear cookies; if still paused→10 min cooldown)`
+    );
+    chrome.runtime.sendMessage({ action: 'browsingActivityPaused' }, () => {
+        if (chrome.runtime.lastError) {
+            console.warn('[CS] browsingActivityPaused message:', chrome.runtime.lastError.message);
+            __etkBrowsingPauseRecoveryStarted = false;
+        }
+    });
+    // If pause clears without reload (rare), allow re-notify later
+    const clearWatch = setInterval(() => {
+        if (!isBrowsingActivityPausedOnPage()) {
+            clearInterval(clearWatch);
+            __etkBrowsingPauseRecoveryStarted = false;
+            console.log('[CS] Browsing activity pause cleared.');
+        }
+    }, 2000);
+    setTimeout(() => clearInterval(clearWatch), BROWSING_PAUSE_WAIT_MS + 5000);
+    return true;
+}
+
+// Start recovery if this page is currently browsing-paused (all eticketing pages).
+startBrowsingActivityPauseRecoveryIfNeeded();
 
 let monitor = {
     running: false,
@@ -50,17 +109,125 @@ let monitor = {
 };
 
 const VALIDATION_TAB_QUERY = 'eventId=4&reason=EventArchived';
+/** Legacy flat metrics (migrated once into per-event map). */
 const VALIDATION_DASHBOARD_METRICS_KEY = 'validationDashboardMetrics';
+/** Per-event session history: { [normalizedEventUrl]: { seatsLocked, seatLockFailed, cookiesCleared } } */
+const VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY = 'validationDashboardMetricsByEvent';
 const VALIDATION_DASHBOARD_ID = 'etk-validation-dashboard';
 const VALIDATION_DASHBOARD_STYLE_ID = 'etk-validation-dashboard-style';
 let validationDashboardEls = null;
 let validationDashboardSheetStatus = '';
 let validationDashboardSheetRow = null;
 let validationDashboardMetrics = { seatsLocked: 0, seatLockFailed: 0, cookiesCleared: 0 };
+/** Normalized eventUrl key that `validationDashboardMetrics` currently represents. */
+let validationDashboardMetricsEventKey = '';
 let validationMetricsPersistTimer = null;
+let validationMetricsLoadPromise = null;
 
 function isValidationTabPage() {
     return window.location.search.includes(VALIDATION_TAB_QUERY);
+}
+
+function emptyValidationMetrics() {
+    return { seatsLocked: 0, seatLockFailed: 0, cookiesCleared: 0 };
+}
+
+/** Stable key so the same event keeps one history regardless of query/hash/trailing slash. */
+function normalizeEventUrlHistoryKey(url) {
+    const raw = (url || '').toString().trim();
+    if (!raw) return '';
+    try {
+        const u = new URL(raw);
+        const path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+        return (u.protocol + '//' + u.hostname.toLowerCase() + path).toLowerCase();
+    } catch (_) {
+        return raw.split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
+    }
+}
+
+function parseValidationMetricsObj(obj) {
+    if (!obj || typeof obj !== 'object') return emptyValidationMetrics();
+    return {
+        seatsLocked: Number(obj.seatsLocked) || 0,
+        seatLockFailed: Number(obj.seatLockFailed) || 0,
+        cookiesCleared: Number(obj.cookiesCleared) || 0
+    };
+}
+
+/**
+ * Load Session History counters for the given event URL (separate history per event).
+ * Migrates legacy flat metrics into this event once if the by-event map is empty.
+ */
+async function loadValidationMetricsForEventUrl(eventUrl) {
+    const key = normalizeEventUrlHistoryKey(eventUrl);
+    validationDashboardMetricsEventKey = key;
+    if (!key) {
+        validationDashboardMetrics = emptyValidationMetrics();
+        return;
+    }
+    const st = await chrome.storage.local.get([
+        VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY,
+        VALIDATION_DASHBOARD_METRICS_KEY
+    ]);
+    const byEvent =
+        st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] &&
+        typeof st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] === 'object'
+            ? { ...st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] }
+            : {};
+    if (byEvent[key]) {
+        validationDashboardMetrics = parseValidationMetricsObj(byEvent[key]);
+        return;
+    }
+    const legacy = st[VALIDATION_DASHBOARD_METRICS_KEY];
+    const legacyParsed = parseValidationMetricsObj(legacy);
+    const hasLegacy =
+        legacyParsed.seatsLocked > 0 ||
+        legacyParsed.seatLockFailed > 0 ||
+        legacyParsed.cookiesCleared > 0;
+    if (hasLegacy && Object.keys(byEvent).length === 0) {
+        validationDashboardMetrics = legacyParsed;
+        byEvent[key] = { ...legacyParsed };
+        await chrome.storage.local.set({
+            [VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY]: byEvent,
+            [VALIDATION_DASHBOARD_METRICS_KEY]: emptyValidationMetrics()
+        });
+        console.log('[CS] Migrated legacy Session History into event key:', key);
+        return;
+    }
+    validationDashboardMetrics = emptyValidationMetrics();
+}
+
+async function ensureValidationMetricsMatchEventUrl(eventUrl) {
+    const nextKey = normalizeEventUrlHistoryKey(eventUrl);
+    if (nextKey === validationDashboardMetricsEventKey) return;
+    if (validationMetricsLoadPromise) await validationMetricsLoadPromise;
+    if (nextKey === validationDashboardMetricsEventKey) return;
+    validationMetricsLoadPromise = loadValidationMetricsForEventUrl(eventUrl).finally(() => {
+        validationMetricsLoadPromise = null;
+    });
+    await validationMetricsLoadPromise;
+}
+
+function persistValidationMetricsSoon() {
+    if (validationMetricsPersistTimer) clearTimeout(validationMetricsPersistTimer);
+    validationMetricsPersistTimer = setTimeout(() => {
+        validationMetricsPersistTimer = null;
+        const key =
+            validationDashboardMetricsEventKey ||
+            normalizeEventUrlHistoryKey(monitor.eventUrl);
+        if (!key) return;
+        chrome.storage.local.get([VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY], (st) => {
+            if (chrome.runtime.lastError) return;
+            const byEvent =
+                st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] &&
+                typeof st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] === 'object'
+                    ? { ...st[VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY] }
+                    : {};
+            byEvent[key] = { ...validationDashboardMetrics };
+            validationDashboardMetricsEventKey = key;
+            chrome.storage.local.set({ [VALIDATION_DASHBOARD_METRICS_BY_EVENT_KEY]: byEvent });
+        });
+    }, 500);
 }
 
 function bumpValidationMetric(key, amount = 1) {
@@ -68,16 +235,33 @@ function bumpValidationMetric(key, amount = 1) {
     if (!Object.prototype.hasOwnProperty.call(validationDashboardMetrics, key)) return;
     const delta = Number(amount) || 0;
     if (delta <= 0) return;
-    validationDashboardMetrics[key] += delta;
-    renderValidationDashboard();
-    if (validationMetricsPersistTimer) clearTimeout(validationMetricsPersistTimer);
-    validationMetricsPersistTimer = setTimeout(() => {
-        chrome.storage.local.set({ [VALIDATION_DASHBOARD_METRICS_KEY]: validationDashboardMetrics });
-        validationMetricsPersistTimer = null;
-    }, 500);
+    const eventKey = normalizeEventUrlHistoryKey(monitor.eventUrl);
+    if (!eventKey) {
+        console.warn('[CS] Session History bump skipped — no eventUrl set');
+        return;
+    }
+    const applyBump = () => {
+        if (!Object.prototype.hasOwnProperty.call(validationDashboardMetrics, key)) return;
+        validationDashboardMetrics[key] += delta;
+        renderValidationDashboard();
+        persistValidationMetricsSoon();
+    };
+    if (eventKey !== validationDashboardMetricsEventKey) {
+        ensureValidationMetricsMatchEventUrl(monitor.eventUrl).then(applyBump);
+        return;
+    }
+    applyBump();
 }
 
 function formatStatusBadge(snapshot) {
+    const browseCooldownUntil = Number(snapshot.browsingPauseCooldownUntil) || 0;
+    if (browseCooldownUntil > Date.now()) {
+        const remainMin = Math.max(1, Math.ceil((browseCooldownUntil - Date.now()) / 60000));
+        return { label: 'Paused (Browsing) • ' + remainMin + 'm cooldown', cls: 'st403' };
+    }
+    if (typeof isBrowsingActivityPausedOnPage === 'function' && isBrowsingActivityPausedOnPage()) {
+        return { label: 'Paused (Browsing Activity)', cls: 'st403' };
+    }
     const pauseUntil = Number(snapshot.error403PauseUntil) || 0;
     const pauseActive = pauseUntil > Date.now();
     const queueActive = snapshot.inQueueWaiting === true;
@@ -163,11 +347,13 @@ function ensureValidationDashboardDom() {
             <div class="row"><div class="title">Ticket Monitor Status</div><div id="etkBadge" class="badge stIdle">Idle</div></div>
             <div class="grid">
                 <div class="card"><div class="k">Google Sheet Status</div><div id="etkSheetStatus" class="v">-</div></div>
+                <div class="card"><div class="k">Event URL</div><div id="etkEventUrl" class="v">-</div></div>
                 <div class="card"><div class="k">Start Second</div><div id="etkStartSecond" class="v">-</div></div>
                 <div class="card"><div class="k">Queue Waiting</div><div id="etkQueue" class="v">-</div></div>
                 <div class="card"><div class="k">Error403 Pause</div><div id="etk403" class="v">-</div></div>
                 <div class="card"><div class="k">Email</div><div id="etkEmail" class="v">-</div></div>
                 <div class="card"><div class="k">Pair Check Chance</div><div id="etkPairChance" class="v">-</div></div>
+                <div class="card"><div class="k">Resale Endpoint Chances</div><div id="etkResaleChance" class="v">-</div></div>
             </div>
             <div class="sec">
                 <div class="title" style="font-size:16px">Session History</div>
@@ -181,14 +367,42 @@ function ensureValidationDashboardDom() {
         `;
         document.body.prepend(root);
     }
+    if (!document.getElementById('etkResaleChance')) {
+        const grid = root.querySelector('.grid');
+        if (grid) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.innerHTML = '<div class="k">Resale Endpoint Chances</div><div id="etkResaleChance" class="v">-</div>';
+            grid.appendChild(card);
+        }
+    }
+    if (!document.getElementById('etkEventUrl')) {
+        const statusGrid = root.querySelector('.grid');
+        if (statusGrid) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.innerHTML = '<div class="k">Event URL</div><div id="etkEventUrl" class="v">-</div>';
+            const afterSheet = document.getElementById('etkSheetStatus');
+            const sheetCard = afterSheet && afterSheet.closest ? afterSheet.closest('.card') : null;
+            if (sheetCard && sheetCard.nextSibling) {
+                statusGrid.insertBefore(card, sheetCard.nextSibling);
+            } else if (sheetCard) {
+                statusGrid.appendChild(card);
+            } else {
+                statusGrid.insertBefore(card, statusGrid.firstChild);
+            }
+        }
+    }
     validationDashboardEls = {
         badge: document.getElementById('etkBadge'),
         sheetStatus: document.getElementById('etkSheetStatus'),
+        eventUrl: document.getElementById('etkEventUrl'),
         startSecond: document.getElementById('etkStartSecond'),
         queue: document.getElementById('etkQueue'),
         pause403: document.getElementById('etk403'),
         email: document.getElementById('etkEmail'),
         pairChance: document.getElementById('etkPairChance'),
+        resaleChance: document.getElementById('etkResaleChance'),
         locked: document.getElementById('etkLocked'),
         lockFail: document.getElementById('etkLockFail'),
         cookies: document.getElementById('etkCookies'),
@@ -202,6 +416,12 @@ function renderValidationDashboard(snapshot = {}) {
     validationDashboardEls.badge.className = 'badge ' + badge.cls;
     validationDashboardEls.badge.textContent = badge.label;
     validationDashboardEls.sheetStatus.textContent = validationDashboardSheetStatus || (monitor.running ? 'On' : 'Unknown');
+    const eventUrl =
+        (snapshot.eventUrl || monitor.eventUrl || '').toString().trim();
+    if (validationDashboardEls.eventUrl) {
+        validationDashboardEls.eventUrl.textContent = eventUrl || '(not set)';
+        validationDashboardEls.eventUrl.title = eventUrl || '';
+    }
     validationDashboardEls.startSecond.textContent = monitor.startSecond != null ? String(monitor.startSecond) : '(not set)';
     validationDashboardEls.queue.textContent = snapshot.inQueueWaiting === true ? 'Yes (waiting)' : 'No';
     const until = Number(snapshot.error403PauseUntil) || 0;
@@ -210,6 +430,18 @@ function renderValidationDashboard(snapshot = {}) {
     validationDashboardEls.email.textContent = email || '(not set)';
     const pairChance = monitor.pairCheckChancePct != null ? String(monitor.pairCheckChancePct) + '%' : '(sheet default)';
     validationDashboardEls.pairChance.textContent = pairChance;
+    let resalePct = null;
+    if (validationDashboardSheetRow) {
+        resalePct = getResaleEndpointChancesFromRow(validationDashboardSheetRow);
+    }
+    if (resalePct == null && snapshot.resaleEndpointChances != null && snapshot.resaleEndpointChances !== '') {
+        const n = parseFloat(snapshot.resaleEndpointChances);
+        if (Number.isFinite(n)) resalePct = Math.min(100, Math.max(0, n));
+    }
+    if (resalePct == null) resalePct = DEFAULT_RESALE_ENDPOINT_CHANCES;
+    if (validationDashboardEls.resaleChance) {
+        validationDashboardEls.resaleChance.textContent = String(resalePct) + '%';
+    }
     validationDashboardEls.mode.textContent = monitor.areSeatsTogether ? 'Pair / quantity ' + monitor.quantity : 'Single / quantity ' + monitor.quantity;
     validationDashboardEls.locked.textContent = String(validationDashboardMetrics.seatsLocked || 0);
     validationDashboardEls.lockFail.textContent = String(validationDashboardMetrics.seatLockFailed || 0);
@@ -232,23 +464,31 @@ async function refreshValidationDashboardSheetData() {
 async function updateValidationDashboard() {
     if (!isValidationTabPage()) return;
     ensureValidationDashboardDom();
-    const snap = await chrome.storage.local.get(['error403PauseUntil', 'inQueueWaiting', 'startSecond', 'loginEmail']);
+    const snap = await chrome.storage.local.get([
+        'error403PauseUntil',
+        'inQueueWaiting',
+        'startSecond',
+        'loginEmail',
+        'resaleEndpointChances',
+        'browsingPauseCooldownUntil',
+        'eventUrl'
+    ]);
     if (snap.startSecond != null && snap.startSecond !== '' && !Number.isNaN(parseFloat(snap.startSecond))) {
         monitor.startSecond = parseFloat(snap.startSecond);
     }
+    const eventUrlForHistory = (snap.eventUrl || monitor.eventUrl || '').trim();
+    if (eventUrlForHistory) {
+        monitor.eventUrl = eventUrlForHistory;
+    }
+    await ensureValidationMetricsMatchEventUrl(eventUrlForHistory);
     renderValidationDashboard(snap);
 }
 
 async function initValidationDashboard() {
     if (!isValidationTabPage()) return;
-    const m = await chrome.storage.local.get([VALIDATION_DASHBOARD_METRICS_KEY]);
-    if (m && m[VALIDATION_DASHBOARD_METRICS_KEY]) {
-        validationDashboardMetrics = {
-            seatsLocked: Number(m[VALIDATION_DASHBOARD_METRICS_KEY].seatsLocked) || 0,
-            seatLockFailed: Number(m[VALIDATION_DASHBOARD_METRICS_KEY].seatLockFailed) || 0,
-            cookiesCleared: Number(m[VALIDATION_DASHBOARD_METRICS_KEY].cookiesCleared) || 0
-        };
-    }
+    const st = await chrome.storage.local.get(['eventUrl']);
+    const eventUrlForHistory = (st.eventUrl || monitor.eventUrl || '').trim();
+    await loadValidationMetricsForEventUrl(eventUrlForHistory);
     ensureValidationDashboardDom();
     await refreshValidationDashboardSheetData();
     await updateValidationDashboard();
@@ -257,6 +497,16 @@ async function initValidationDashboard() {
         await refreshValidationDashboardSheetData();
         await updateValidationDashboard();
     }, 30000);
+    try {
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== 'local' || !changes.eventUrl || !isValidationTabPage()) return;
+            const next = (changes.eventUrl.newValue || '').toString().trim();
+            if (next) monitor.eventUrl = next;
+            ensureValidationMetricsMatchEventUrl(next).then(() => {
+                renderValidationDashboard({ eventUrl: next });
+            });
+        });
+    } catch (_) {}
 }
 
 /**
@@ -280,27 +530,98 @@ function shouldNavigateFromLogoutOrSessionTimeout(currentHref, storedEventUrl) {
     }
 }
 
+/** eTicketing account blackout / restriction landing (do not redirect away; stop bot). */
+function isUrlAccountRestrictedBlackout(href) {
+    const u = (href || '').toLowerCase();
+    return u.includes('accountrestrictederrormessage') && u.includes('bodykey=warn_login_blackoutlimitreached');
+}
+
+/** Event tab redirected to EventNotAllowed with reason=EventRestricted — stop monitoring; keep tab open. */
+function isUrlEventRestricted(href) {
+    const u = (href || '').toLowerCase();
+    if (!u.includes('/edp/validation/eventnotallowed')) return false;
+    try {
+        const parsed = new URL(href);
+        return (parsed.searchParams.get('reason') || '').toLowerCase() === 'eventrestricted';
+    } catch {
+        return u.includes('reason=eventrestricted');
+    }
+}
+
+let __etkAccountRestrictedBlackoutReported = false;
+let __etkEventRestrictedStopReported = false;
+async function reportAccountRestrictedBlackoutStop(source) {
+    if (__etkAccountRestrictedBlackoutReported) return;
+    __etkAccountRestrictedBlackoutReported = true;
+    console.warn(
+        '[CS] Account restricted (Warn_Login_BlackoutLimitReached) — stopping bot; leaving this tab open.',
+        source || ''
+    );
+    await chrome.storage.local.set({ accountRestrictedBlackoutStop: true, currentStatus: 'off' });
+    chrome.runtime.sendMessage({ action: 'accountRestrictedBlackoutStop' }, () => {
+        if (chrome.runtime.lastError) {
+            console.warn('[CS] accountRestrictedBlackoutStop message:', chrome.runtime.lastError.message);
+        }
+    });
+    try {
+        if (typeof monitor !== 'undefined' && monitor.running && typeof isValidationTabPage === 'function' && isValidationTabPage()) {
+            if (typeof stopMonitoring === 'function') stopMonitoring('account restricted blackout');
+        }
+    } catch (_) {}
+}
+
+async function reportEventRestrictedStop(source) {
+    if (__etkEventRestrictedStopReported) return;
+    __etkEventRestrictedStopReported = true;
+    console.warn(
+        '[CS] Event restricted (EventNotAllowed?reason=EventRestricted) — stopping monitoring; leaving this tab open.',
+        source || ''
+    );
+    await chrome.storage.local.set({ eventRestrictedStop: true, currentStatus: 'off' });
+    chrome.runtime.sendMessage({ action: 'eventRestrictedStop' }, () => {
+        if (chrome.runtime.lastError) {
+            console.warn('[CS] eventRestrictedStop message:', chrome.runtime.lastError.message);
+        }
+    });
+    try {
+        if (typeof monitor !== 'undefined' && monitor.running && typeof isValidationTabPage === 'function' && isValidationTabPage()) {
+            if (typeof stopMonitoring === 'function') stopMonitoring('event restricted');
+        }
+    } catch (_) {}
+}
+
 /**
  * Logout landing: `https://www.eticketing.co.uk/{club}/?PublishLogoutDataLayer=true`
+ * Seid landing: `https://www.eticketing.co.uk/{club}?seid=...` (same handling as PublishLogout).
  * Session-timeout landing: `https://www.eticketing.co.uk/{club}/Error/CommonWithTitle?key=Message_SessionTimeout_Light&title=Message_SessionTimeoutTitle_Light`
  * If storage already has this club’s eventUrl but this tab is still on the logout URL, navigate to the event URL.
  * Otherwise set eventUrl and ask background to refresh the event tab.
  */
-const PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS = 5000;
+const PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS = 8000;
 
 (async function syncEventUrlFromPublishLogoutLanding() {
     try {
+        if (isUrlAccountRestrictedBlackout(location.href)) {
+            await reportAccountRestrictedBlackoutStop('account-restricted-url');
+            return;
+        }
         const u = new URL(location.href);
         if (u.hostname.toLowerCase() !== 'www.eticketing.co.uk') return;
         const flag = (u.searchParams.get('PublishLogoutDataLayer') || '').toLowerCase();
+        const seidParam = (u.searchParams.get('seid') || '').trim();
         const keyParam = (u.searchParams.get('key') || '').toLowerCase();
         const titleParam = (u.searchParams.get('title') || '').toLowerCase();
         const isPublishLogout = flag === 'true';
+        const isSeidLanding =
+            !!seidParam &&
+            /^\/[a-z0-9_-]+\/?$/i.test(u.pathname) &&
+            !u.pathname.toLowerCase().includes('/edp/');
         const isSessionTimeoutCommonWithTitle =
             u.pathname.toLowerCase().includes('/error/commonwithtitle') &&
             keyParam === 'message_sessiontimeout_light' &&
             titleParam === 'message_sessiontimeouttitle_light';
-        if (!isPublishLogout && !isSessionTimeoutCommonWithTitle) return;
+        const isPublishLogoutLike = isPublishLogout || isSeidLanding;
+        if (!isPublishLogoutLike && !isSessionTimeoutCommonWithTitle) return;
 
         const segments = u.pathname.split('/').filter(Boolean);
         if (!segments.length) return;
@@ -316,9 +637,9 @@ const PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS = 5000;
         if (existing && existing.toLowerCase().startsWith(clubPrefixLower)) {
             if (shouldNavigateFromLogoutOrSessionTimeout(location.href, existing)) {
                 const dest = existing.split('#')[0].trim();
-                if (isPublishLogout) {
+                if (isPublishLogoutLike) {
                     console.log(
-                        '[CS] PublishLogoutDataLayer landing: waiting ' +
+                        '[CS] PublishLogout/seid landing: waiting ' +
                             PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS / 1000 +
                             's before redirect to stored eventUrl...'
                     );
@@ -328,9 +649,9 @@ const PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS = 5000;
                 window.location.replace(dest);
                 return;
             }
-            if (isPublishLogout) {
+            if (isPublishLogoutLike) {
                 console.log(
-                    '[CS] PublishLogoutDataLayer landing: waiting ' +
+                    '[CS] PublishLogout/seid landing: waiting ' +
                         PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS / 1000 +
                         's before refreshEventTab...'
                 );
@@ -350,20 +671,21 @@ const PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS = 5000;
             ? `${clubOrigin}/EDP/Event/Index/${eidRaw}`
             : `${clubOrigin}/`;
 
+        if (isPublishLogoutLike) {
+            console.log(
+                '[CS] PublishLogout/seid landing: waiting ' +
+                    PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS / 1000 +
+                    's before setting eventUrl in this tab and opening event tab...'
+            );
+            await delay(PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS);
+        }
+
         await chrome.storage.local.set({ eventUrl: newUrl });
         monitor.eventUrl = newUrl;
         if (eidRaw) monitor.eventId = eidRaw;
 
         console.log('[CS] Logout/session-timeout landing: set eventUrl for quick event tab:', newUrl);
 
-        if (isPublishLogout) {
-            console.log(
-                '[CS] PublishLogoutDataLayer landing: waiting ' +
-                    PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS / 1000 +
-                    's before refreshEventTab (open event tab)...'
-            );
-            await delay(PUBLISH_LOGOUT_BEFORE_EVENT_NAV_MS);
-        }
         chrome.runtime.sendMessage({ action: 'refreshEventTab' }, () => {
             if (chrome.runtime.lastError) {
                 console.warn('[CS] Logout/session-timeout: refreshEventTab message failed:', chrome.runtime.lastError.message);
@@ -380,7 +702,7 @@ const DEFAULT_RESALE_ENDPOINT_CHANCES = 96;
 // Club-based PriceClassId mapping
 const clubPriceClassIdMap = {
     'arsenal': 1,
-    'nottinghamforest': 209,//317 was working before but for champion leage 209
+    'nottinghamforest': 317,//209,//317 was working before but for champion leage 209
     'cpfc': 1,  // Crystal Palace - default to 1, update if needed
     'chelseafc': 2,  // Chelsea - default to 1, update if needed
     'tottenhamhotspur': 1,
@@ -409,6 +731,43 @@ function getPriceClassIdForClub(clubName) {
 
     try {
         await initValidationDashboard();
+        if (isBrowsingActivityPausedOnPage()) {
+            console.warn('[CS] Browsing activity paused on validation tab — not starting seat checks until it clears');
+            startBrowsingActivityPauseRecoveryIfNeeded();
+            // Poll until pause clears (e.g. after BG/CS reload recovers), then start monitoring
+            const waitUntilClear = setInterval(async () => {
+                if (isBrowsingActivityPausedOnPage()) return;
+                const { browsingPauseCooldownUntil = 0 } = await chrome.storage.local.get('browsingPauseCooldownUntil');
+                if (Number(browsingPauseCooldownUntil) > Date.now()) return;
+                clearInterval(waitUntilClear);
+                if (monitor.running) return;
+                console.log('[CS] Browsing pause cleared — auto-starting monitor');
+                try {
+                    await startMonitorFlow();
+                } catch (e) {
+                    console.error('[CS] Auto startMonitorFlow after browsing pause error:', e);
+                }
+            }, 2000);
+            return;
+        }
+        const { browsingPauseCooldownUntil = 0 } = await chrome.storage.local.get('browsingPauseCooldownUntil');
+        if (Number(browsingPauseCooldownUntil) > Date.now()) {
+            console.warn('[CS] Browsing-pause 10 min cooldown active — delaying auto-start');
+            const waitCooldown = setInterval(async () => {
+                const st = await chrome.storage.local.get('browsingPauseCooldownUntil');
+                if (Number(st.browsingPauseCooldownUntil) > Date.now()) return;
+                if (isBrowsingActivityPausedOnPage()) return;
+                clearInterval(waitCooldown);
+                if (monitor.running) return;
+                console.log('[CS] Browsing-pause cooldown ended — auto-starting monitor');
+                try {
+                    await startMonitorFlow();
+                } catch (e) {
+                    console.error('[CS] Auto startMonitorFlow after cooldown error:', e);
+                }
+            }, 5000);
+            return;
+        }
         console.log('[CS] Auto-starting monitor on page load');
         await startMonitorFlow();
     } catch (e) {
@@ -416,19 +775,35 @@ function getPriceClassIdForClub(clubName) {
     }
 })();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.action === 'isBrowsingActivityPaused') {
+        sendResponse({ paused: isBrowsingActivityPausedOnPage() });
+        return false;
+    }
     if (msg.action === 'error403Resume') {
         console.log('[CS] error403 pause ended - resuming seat check instantly');
-        if (monitor.running) runCheck();
+        if (monitor.running && !isBrowsingActivityPausedOnPage()) runCheck();
         return;
     }
     if (window.location.search.includes("eventId=4&reason=EventArchived")) {
         if (msg.action === 'startMonitoring') {//start will be from backgroun script
             console.log('[CS] received startMonitoring', msg);
-            monitor.sheetUrl = msg.sheetUrl || monitor.sheetUrl;
-            monitor.startSecond = (msg.startSecond); // set in extension popup, received as a message
+            if (isBrowsingActivityPausedOnPage()) {
+                console.warn('[CS] Ignoring startMonitoring — browsing activity still paused');
+                startBrowsingActivityPauseRecoveryIfNeeded();
+                return;
+            }
+            chrome.storage.local.get('browsingPauseCooldownUntil', (st) => {
+                if (Number(st.browsingPauseCooldownUntil) > Date.now()) {
+                    console.warn('[CS] Ignoring startMonitoring — browsing-pause 10 min cooldown active');
+                    return;
+                }
+                monitor.sheetUrl = msg.sheetUrl || monitor.sheetUrl;
+                monitor.startSecond = (msg.startSecond); // set in extension popup, received as a message
 
-            // eventUrl may be provided in msg or we can get from sheet
-            startMonitorFlow().catch(e => console.error('[CS] startMonitorFlow error', e));
+                // eventUrl may be provided in msg or we can get from sheet
+                startMonitorFlow().catch(e => console.error('[CS] startMonitorFlow error', e));
+            });
+            return;
         }
         if (msg.action === 'stopMonitoring') {
             stopMonitoring('stop message from background');
@@ -444,7 +819,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function startMonitorFlow() {
     console.log('[CS] startMonitorFlow begin');
 
-    // currentStatus: currentStatus,
+    if (isBrowsingActivityPausedOnPage()) {
+        console.warn('[CS] startMonitorFlow aborted — browsing activity paused (no seat checks)');
+        startBrowsingActivityPauseRecoveryIfNeeded();
+        return;
+    }
+    const { browsingPauseCooldownUntil = 0 } = await chrome.storage.local.get('browsingPauseCooldownUntil');
+    if (Number(browsingPauseCooldownUntil) > Date.now()) {
+        const remainSec = Math.ceil((Number(browsingPauseCooldownUntil) - Date.now()) / 1000);
+        console.warn('[CS] startMonitorFlow aborted — browsing-pause 10 min cooldown active (' + remainSec + 's left)');
+        return;
+    }
     //                         eventUrl: row.eventUrl,
     //                         startSecond: row.startSecond,
     //                         areSeatsTogether: row.areSeatsTogether === 'true', // convert to boolean
@@ -531,6 +916,8 @@ async function startMonitorFlow() {
         // Legacy flag from prior "reload validation tab" behavior is no longer used.
         await chrome.storage.local.set({ seat403AfterReloadNeeds12s: false });
         monitor.running = true;
+        seatCheckLoopIteration = 0;
+        lastLoggedSeatCheckSheetStatus = null;
         console.log('[CS] starting ======== monitor loop');
         //run immediate check once for first time
         // await alignToStartSecond(monitor.startSecond).catch(e => console.error('[CS] alignToStartSecond error', e));
@@ -582,6 +969,14 @@ function getAlignMsToNextInterval(dateNow, startSecondVal, intervalMs) {
 async function scheduleNextCheck() {
     const waitMs = 12000; // 12s cycle: extension N refreshes when clock (sec % 12) === N (e.g. ext 1 at :01/:13/:25, ext 1.5 at :01.5/:13.5)
     const realignIntervalMs = 120000; // 2 min log only; schedule is always from clock
+
+    // While Queue-IT is active, do not drive heartbeat health monitoring (BG freezes too); poll lightly until queue clears
+    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+    if (inQueueWaiting === true) {
+        if (nextCheckTimeoutId != null) clearTimeout(nextCheckTimeoutId);
+        nextCheckTimeoutId = setTimeout(() => { nextCheckTimeoutId = null; runCheck(); }, 5000);
+        return;
+    }
 
     // During error403 pause, poll every 5s so we resume quickly when flag clears
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
@@ -649,6 +1044,12 @@ async function runCheck() {
     if (runCheckInProgress) return; // prevent duplicate API calls when two timeouts or resume fire close together
     runCheckInProgress = true;
     try {
+        if (monitor.running) {
+            if (seatCheckLoopIteration > 0) {
+                console.log('');
+            }
+            seatCheckLoopIteration++;
+        }
         lastRunStartTime = Date.now();
         await checkOnce().catch(e => console.error('[CS] checkOnce err', e));
         if (monitor.running) scheduleNextCheck();
@@ -777,13 +1178,18 @@ function getLoginEmailFromSheetRow(row) {
 
 async function persistLoginEmailFromSheetRow(row, sourceLabel) {
     const email = getLoginEmailFromSheetRow(row);
-    await chrome.storage.local.set({ loginEmail: email });
-    if (email) {
-        console.log('[CS] loginEmail updated from', sourceLabel || 'sheet', ':', email.substring(0, 5) + '...');
-    } else {
-        console.warn('[CS] loginEmail missing/blank in', sourceLabel || 'sheet', '- stored as empty string');
+    const prev = await chrome.storage.local.get('loginEmail');
+    const prevEmail = String(prev.loginEmail || '').trim();
+    const nextEmail = String(email || '').trim();
+    await chrome.storage.local.set({ loginEmail: nextEmail });
+    if (nextEmail !== prevEmail) {
+        if (nextEmail) {
+            console.log('[CS] loginEmail updated from', sourceLabel || 'sheet', ':', nextEmail.substring(0, 5) + '...');
+        } else {
+            console.warn('[CS] loginEmail cleared in', sourceLabel || 'sheet');
+        }
     }
-    return email;
+    return nextEmail;
 }
 
 /** When Pair check chance is set, roll every seat API cycle (pair = true & 2, else false & 1). */
@@ -866,6 +1272,10 @@ async function getMatchingRowFromSheet(sheetUrl, startSecond) {
 }
 
 let checksheet = true;//read sheet one time and not next and so on
+/** Dedupe `[CS] sheet status on` when unchanged between sheet polls. */
+let lastLoggedSeatCheckSheetStatus = null;
+/** Printed blank line between seat-check iterations (starts at 2nd runCheck). */
+let seatCheckLoopIteration = 0;
 
 // Separate error counters for different error types
 let error403Count = 0;           // For 403 Forbidden errors (seat check)
@@ -1148,31 +1558,99 @@ function plainTextFromLockApiBody(raw) {
         .trim();
 }
 
-/** Read `fetch` response body once; normalize HTML or plain text for notifications. */
-async function plainTextFromFetchResponse(res) {
-    if (!res || typeof res.text !== 'function') return '';
+/** Pull human-readable lines from JSON lock / validation error bodies. */
+function plainTextFromJsonLockError(obj) {
+    if (obj == null) return '';
+    if (typeof obj === 'string') return obj.trim();
+    const parts = [];
+    const push = (v) => {
+        if (v == null || v === '') return;
+        const s = String(v).trim();
+        if (s) parts.push(s);
+    };
+    push(obj.Message);
+    push(obj.message);
+    push(obj.error);
+    push(obj.Error);
+    push(obj.title);
+    push(obj.Title);
+    push(obj.ExceptionMessage);
+    push(obj.Detail);
+    push(obj.detail);
+    if (Array.isArray(obj.Errors)) {
+        for (const e of obj.Errors) {
+            if (typeof e === 'string') push(e);
+            else if (e && typeof e === 'object') {
+                push(e.ErrorMessage || e.Message || e.message || e.error);
+            }
+        }
+    }
+    if (obj.ModelState && typeof obj.ModelState === 'object') {
+        for (const k of Object.keys(obj.ModelState)) {
+            const arr = obj.ModelState[k];
+            if (Array.isArray(arr)) arr.forEach((x) => push(x));
+        }
+    }
+    if (parts.length) return parts.join('\n');
     try {
-        return plainTextFromLockApiBody(await res.text());
+        return JSON.stringify(obj, null, 2);
     } catch (_) {
         return '';
     }
 }
 
-/** IIS / long HTML errors: keep only text before "Most likely causes:" so Discord stays readable. */
+/** Raw lock API body → text for Discord (JSON messages or HTML stripped). */
+function extractLockApiErrorTextFromRaw(raw) {
+    const t = typeof raw === 'string' ? raw.trim() : '';
+    if (!t) return '';
+    const looksJson = (t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'));
+    if (looksJson) {
+        try {
+            const j = JSON.parse(t);
+            const fromJson = plainTextFromJsonLockError(j);
+            if (fromJson && fromJson.trim()) return fromJson.trim();
+        } catch (_) {
+            /* not valid JSON, fall through */
+        }
+    }
+    return plainTextFromLockApiBody(t);
+}
+
+/** Read `fetch` response body once; normalize HTML, JSON, or plain text for notifications. */
+async function plainTextFromFetchResponse(res) {
+    if (!res || typeof res.text !== 'function') return '';
+    try {
+        const raw = await res.text();
+        return extractLockApiErrorTextFromRaw(raw);
+    } catch (_) {
+        return '';
+    }
+}
+
+/** IIS / long HTML errors: prefer text before "Most likely causes:" when that head is substantial; otherwise keep full body so we do not drop the only useful text. */
 function clipLockApiBodyForDiscord(plain) {
     let s = String(plain).trim();
+    if (!s) return '';
     const re = /most likely causes:/i;
     const m = re.exec(s);
-    if (m) s = s.slice(0, m.index).trim();
-    return s.replace(/\s+$/, '');
+    if (!m) return s.replace(/\s+$/, '');
+    const head = s.slice(0, m.index).trim();
+    // If stripping at "Most likely causes" removes almost everything, keep full text (common on 404 IIS pages).
+    if (head.length < 40) return s.replace(/\s+$/, '');
+    return head.replace(/\s+$/, '');
 }
 
 /** Non-empty API body snippet for Discord (capped length for webhook limits). */
 function discordResponseBodySection(label, plain) {
-    if (!plain || !String(plain).trim()) return '';
+    const raw = plain != null ? String(plain) : '';
+    const trimmed = raw.trim();
+    if (!trimmed) {
+        return '\n📄 **' + label + ':**\n_(no response body or empty)_';
+    }
     const max = 1800;
-    let s = clipLockApiBodyForDiscord(String(plain));
-    if (!s) return '';
+    let s = clipLockApiBodyForDiscord(trimmed);
+    if (!s) s = trimmed;
+    if (!s) return '\n📄 **' + label + ':**\n_(empty after normalizing)_';
     if (s.length > max) s = s.slice(0, max) + '\n… (truncated)';
     return '\n📄 **' + label + ':**\n' + s;
 }
@@ -1190,6 +1668,41 @@ function formatNotificationEventContext() {
 
 async function checkOnce() {
     if (!monitor.running) return;
+
+    if (isBrowsingActivityPausedOnPage()) {
+        console.warn('[CS] Skipping seat check — browsing activity paused on this tab');
+        startBrowsingActivityPauseRecoveryIfNeeded();
+        return;
+    }
+
+    const { browsingPauseCooldownUntil = 0 } = await chrome.storage.local.get('browsingPauseCooldownUntil');
+    if (Number(browsingPauseCooldownUntil) > Date.now()) {
+        const remainSec = Math.ceil((Number(browsingPauseCooldownUntil) - Date.now()) / 1000);
+        console.warn('[CS] Skipping seat check — browsing-pause 10 min cooldown (' + remainSec + 's left)');
+        return;
+    }
+
+    const { accountRestrictedBlackoutStop, eventRestrictedStop } = await chrome.storage.local.get([
+        'accountRestrictedBlackoutStop',
+        'eventRestrictedStop'
+    ]);
+    if (accountRestrictedBlackoutStop === true) {
+        console.log('[CS] accountRestrictedBlackoutStop — halting seat checks.');
+        stopMonitoring('account restricted blackout');
+        return;
+    }
+    if (eventRestrictedStop === true) {
+        console.log('[CS] eventRestrictedStop — halting seat checks.');
+        stopMonitoring('event restricted');
+        return;
+    }
+
+    // Pause seat checking while Queue-IT is active (people ahead / queue waiting)
+    const { inQueueWaiting } = await chrome.storage.local.get('inQueueWaiting');
+    if (inQueueWaiting === true) {
+        console.log('[CS] Queue-IT active (inQueueWaiting) — skipping seat API check');
+        return;
+    }
 
     // Pause seat checking while BG error403 pause is active (duration from sheet/queue path: 5+3·n min, cap 30)
     const { error403PauseUntil = 0 } = await chrome.storage.local.get('error403PauseUntil');
@@ -1252,7 +1765,10 @@ async function checkOnce() {
             });
 
             const status = (matched_row.Status || '').toString().trim().toLowerCase();
-            console.log('[CS] sheet status', status);
+            if (status !== lastLoggedSeatCheckSheetStatus) {
+                console.log('[CS] sheet status', status);
+                lastLoggedSeatCheckSheetStatus = status;
+            }
 
             if (['off', '0', 'false', 'stop'].includes(status)) {
                 console.log('[CS] sheet status is Off, stopping monitoring');
@@ -1420,8 +1936,16 @@ async function checkOnce() {
             consecutiveResaleSeatCheck200Count++;
             if (consecutiveResaleSeatCheck200Count >= 2) {
                 consecutiveResaleSeatCheck200Count = 0;
+                const tierSnap = await chrome.storage.local.get('seatCheck403BackoffTier');
+                const prevTierSnap = Number(tierSnap.seatCheck403BackoffTier) || 0;
                 await chrome.storage.local.set({ seatCheck403BackoffTier: 0 });
-                console.log('[CS] Two consecutive Resale seat check HTTP 200 — reset seatCheck403BackoffTier.');
+                if (prevTierSnap > 0) {
+                    console.log(
+                        '[CS] Two consecutive Resale seat check HTTP 200 — reset seatCheck403BackoffTier (was ' +
+                            prevTierSnap +
+                            ').'
+                    );
+                }
             }
         } else {
             consecutiveResaleSeatCheck200Count = 0;
@@ -1433,17 +1957,18 @@ async function checkOnce() {
     // Handle 403 errors separately
     if (res.status === 403) {
         error403Count++;
-        console.warn('[CS] received 403 Forbidden error from check seats availability API, count:', error403Count);
 
         // At every 3 consecutive 403s (3, 6, 9, ...): 1st → 0s + refresh event tab + 12s + tier 1; 2nd+ → Discord + clear cookies + refresh + 30s + tier 0.
         if (error403Count >= 3 && error403Count % 3 === 0) {
-            console.warn('[CS] 3 consecutive 403 errors — backoff wait, notify, refresh event URL tab, then 12s + next API slot.');
-            logSeatsOutcome('403×3 — backoff + refresh event URL tab');
-            await handleThreeConsecutiveSeat403BackoffAndReload(logSeatsOutcome);
+            await handleThreeConsecutiveSeat403BackoffAndReload(
+                seatsCheckEndpointLabel,
+                seatsCheckHttpStatus,
+                monitor.quantity
+            );
             return;
         }
 
-        logSeatsOutcome('403 Forbidden on seats check');
+        logSeatsOutcome('403 Forbidden (count ' + error403Count + ')');
         return;
     }
 
@@ -1451,8 +1976,7 @@ async function checkOnce() {
     const otherErrorStatuses = [400, 401, 402, 302, 500];
     if (otherErrorStatuses.includes(res.status)) {
         notfound400erorsCount++;
-        console.warn('[CS] received error status from check seats availability API:', res.status, ', count:', notfound400erorsCount);
-        logSeatsOutcome('Seats check HTTP ' + res.status);
+        logSeatsOutcome('Seats check HTTP ' + res.status + ', other-error streak: ' + notfound400erorsCount);
 
         // If reached 4 errors -> refresh
         if (notfound400erorsCount === 4) {
@@ -1552,6 +2076,15 @@ async function checkOnce() {
     const areaId = area.AreaId;
     const priceBandId = priceBand.PriceBandCode;
 
+    const { startSecond: storedStartSecondForLock } = await chrome.storage.local.get('startSecond');
+    const startSecondDiscordVal =
+        storedStartSecondForLock != null && String(storedStartSecondForLock).trim() !== ''
+            ? String(storedStartSecondForLock).trim()
+            : monitor.startSecond != null && monitor.startSecond !== ''
+              ? String(monitor.startSecond)
+              : '(n/a)';
+    const lockDiscordStartSecondLine = '📊 **startSecond:** ' + startSecondDiscordVal;
+
     let verificationToken = localStorage.getItem("verification_token");
     if (!verificationToken) {
         verificationToken = 'MOn7sdIDdiCrtszHY1RszN2HcxXfJZh4u5JWRkfGzwqplL9l_wSMkXYhJl3VRBglbAZvjJqeNQLamfQkFoO78OD1eLA1';
@@ -1596,7 +2129,11 @@ async function checkOnce() {
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `\n\nError locking seats: ${e.message} for AreaId ${areaId} PriceBandId ${priceBandId}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}`,
+            message:
+                `\n\nError locking seats: ${e.message} for AreaId ${areaId} PriceBandId ${priceBandId}\n👤 **Account:** ${email}\n` +
+                lockDiscordStartSecondLine +
+                formatNotificationEventContext() +
+                `\n📍 **Endpoint:** ${endpointType}\n🔢 **Quantity:** ${monitor.quantity}`,
             payload: null
         });
         logSeatsOutcome('Lock request failed: ' + e.message);
@@ -1607,14 +2144,18 @@ async function checkOnce() {
     if (lockRes.status === 403) {
         let lock403Plain = '';
         try {
-            lock403Plain = plainTextFromLockApiBody(await lockRes.text());
+            lock403Plain = extractLockApiErrorTextFromRaw(await lockRes.text());
         } catch (e) {
             lock403Plain = '';
         }
 
         if (!(await tryDirectAddToBasketSecondapi(data, clubName, monitor.eventId, verificationToken, endpointType))) {
             const email = await getEmailForNotification();
-            const errorMessage = `🎫 Direct add to basket failed for all areas. Seats were found but could not be added to basket.${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (403) response', lock403Plain)}`;
+            const errorMessage =
+                `🎫 Direct add to basket failed for all areas. Seats were found but could not be added to basket.\n👤 **Account:** ${email}\n` +
+                lockDiscordStartSecondLine +
+                formatNotificationEventContext() +
+                `\n📍 **Endpoint:** ${endpointType}\n🔢 **Quantity:** ${monitor.quantity}${discordResponseBodySection('Lock API (403) response', lock403Plain)}`;
             chrome.runtime.sendMessage({
                 action: 'notifyErrorWebhooks',
                 message: errorMessage,
@@ -1632,7 +2173,11 @@ async function checkOnce() {
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `\n🎫 Seat AreaId ${areaId} PriceBandId ${priceBandId} found but not locked. Status: ${lockRes.status}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
+            message:
+                `\n🎫 Seat AreaId ${areaId} PriceBandId ${priceBandId} found but not locked. Status: ${lockRes.status}\n👤 **Account:** ${email}\n` +
+                lockDiscordStartSecondLine +
+                formatNotificationEventContext() +
+                `\n📍 **Endpoint:** ${endpointType}\n🔢 **Quantity:** ${monitor.quantity}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
             payload: null
         });
         logSeatsOutcome('Lock failed HTTP ' + lockRes.status);
@@ -1643,7 +2188,11 @@ async function checkOnce() {
         const email = await getEmailForNotification();
         chrome.runtime.sendMessage({
             action: 'notifyErrorWebhooks',
-            message: `🎫 Error locking seats: ${lockRes.status} for AreaId ${areaId}${formatNotificationEventContext()}\n🔢 **Quantity:** ${monitor.quantity}\n👤 **Account:** ${email}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
+            message:
+                `🎫 Error locking seats: ${lockRes.status} for AreaId ${areaId}\n👤 **Account:** ${email}\n` +
+                lockDiscordStartSecondLine +
+                formatNotificationEventContext() +
+                `\n📍 **Endpoint:** ${endpointType}\n🔢 **Quantity:** ${monitor.quantity}${discordResponseBodySection('Lock API (' + lockRes.status + ') response', lockErrPlain)}`,
             payload: null
         });
         logSeatsOutcome('Lock failed HTTP ' + lockRes.status);
@@ -1719,9 +2268,11 @@ async function checkOnce() {
 🎫 **Status:** Seat locked successfully but failed to add to basket (HTTP ${putRes.status})
 🆔 **Event ID:** ${monitor.eventId}
 🔗 **Event URL:** ${monitor.eventUrl || '(not set)'}
+📊 **startSecond:** ${startSecondDiscordVal}
 📍 **Area ID:** ${areaId}
 🔢 **Quantity:** ${monitor.quantity}
 👤 **Account:** ${email}
+📍 **Endpoint:** ${endpointType}
             
 🎫 **LOCKED SEATS:**
 ${seatDetails}
@@ -2041,6 +2592,8 @@ ${seatInfo}${pairInfoText}
 function stopMonitoring(reason) {//stop of monitoring will be received from content script signal
     console.log('[CS] stopMonitoring:', reason);
     monitor.running = false;
+    seatCheckLoopIteration = 0;
+    lastLoggedSeatCheckSheetStatus = null;
     if (nextCheckTimeoutId != null) {
         clearTimeout(nextCheckTimeoutId);
         nextCheckTimeoutId = null;
@@ -2050,6 +2603,20 @@ function stopMonitoring(reason) {//stop of monitoring will be received from cont
         monitor.intervalId = null;
     }
 }
+
+void (async () => {
+    try {
+        if (isUrlAccountRestrictedBlackout(location.href)) {
+            await reportAccountRestrictedBlackoutStop('page-load');
+            return;
+        }
+        if (isUrlEventRestricted(location.href)) {
+            await reportEventRestrictedStop('page-load');
+        }
+    } catch (e) {
+        console.warn('[CS] account/event restricted page-load handler error', e);
+    }
+})();
 
 function getRequestVerificationToken() {
     try {
@@ -2132,18 +2699,23 @@ async function fetchPublicIpForDiscord() {
 }
 
 /** Discord when 3×403 triggers cookie clear + refresh (second occurrence path). */
-async function sendSeatCheck403CookieClearDiscord(prevTier) {
+async function sendSeatCheck403CookieClearDiscord(prevTier, endpointLabel) {
     const { startSecond, loginEmail } = await chrome.storage.local.get(['startSecond', 'loginEmail']);
     const ip = await fetchPublicIpForDiscord();
     const ss = startSecond != null && startSecond !== '' ? String(startSecond) : '(n/a)';
     const em = loginEmail && String(loginEmail).trim() ? String(loginEmail).trim() : '(n/a)';
+    const endpointStr =
+        endpointLabel != null && String(endpointLabel).trim() !== '' ? String(endpointLabel).trim() : '(n/a)';
     const message =
-        '**Seat check 3×403 — clear cookies & refresh event tab**\n' +
+        '**Clear Cookies & refresh event tab**\n' +
+        '📧 **loginEmail:** ' +
+        em +
+        '\n' +
         '📊 **startSecond:** ' +
         ss +
         '\n' +
-        '📧 **loginEmail:** ' +
-        em +
+        '📍 **Endpoint:** ' +
+        endpointStr +
         '\n' +
         '🌐 **Public IP:** ' +
         ip +
@@ -2160,7 +2732,8 @@ async function sendSeatCheck403CookieClearDiscord(prevTier) {
             startSecond: ss,
             loginEmail: em,
             publicIp: ip,
-            prevTier
+            prevTier,
+            endpoint: endpointStr
         }
     });
 }
@@ -2174,18 +2747,22 @@ const SEAT_CHECK_403_AFTER_COOKIE_CLEAR_MS = 30 * 1000;
  * - **Again** (tier ≥ 1): Discord (cookie clear), `clearCookiesAndRefresh`, 2s, refresh event tab, 30s with heartbeats, set tier to 0.
  * Tier also resets after 2 consecutive **Resale** HTTP 200s (elsewhere).
  */
-async function handleThreeConsecutiveSeat403BackoffAndReload(detailLogger) {
+async function handleThreeConsecutiveSeat403BackoffAndReload(endpointLabel, httpStatus, quantity) {
     const prev = await chrome.storage.local.get(['seatCheck403BackoffTier']);
     const prevTier = Number(prev.seatCheck403BackoffTier) || 0;
+    const q = quantity != null ? quantity : '?';
+    const http = httpStatus != null ? String(httpStatus) : '403';
 
     if (prevTier === 0) {
-        if (typeof detailLogger === 'function') {
-            detailLogger('403×3 — first path: 0s wait, refresh event tab, then 12s (tier→1)');
-        }
         console.warn(
-            '[CS] 3× seat 403 — first occurrence (tier 0): refresh event URL tab, then ' +
+            '[CS] 403×3 (tier 0): refresh event URL tab → ' +
                 SEAT_CHECK_403_AFTER_FIRST_REFRESH_MS / 1000 +
-                's before next API align; tier → 1.'
+                's → tier 1 | Seats check: ' +
+                endpointLabel +
+                ', HTTP ' +
+                http +
+                ', qty ' +
+                q
         );
         error403Count = 0;
         const refreshed = await refreshEventTabWithTracking();
@@ -2197,18 +2774,20 @@ async function handleThreeConsecutiveSeat403BackoffAndReload(detailLogger) {
         return;
     }
 
-    if (typeof detailLogger === 'function') {
-        detailLogger('403×3 — repeat path: Discord, clear cookies, refresh event tab, 30s, tier→0');
-    }
     console.warn(
-        '[CS] 3× seat 403 — repeat occurrence (tier ' +
+        '[CS] 403×3 (tier ' +
             prevTier +
-            '): Discord + clear cookies + refresh event URL tab, then ' +
+            '): Discord + clear cookies → refresh → ' +
             SEAT_CHECK_403_AFTER_COOKIE_CLEAR_MS / 1000 +
-            's; tier → 0.'
+            's → tier 0 | Seats check: ' +
+            endpointLabel +
+            ', HTTP ' +
+            http +
+            ', qty ' +
+            q
     );
 
-    await sendSeatCheck403CookieClearDiscord(prevTier);
+    await sendSeatCheck403CookieClearDiscord(prevTier, endpointLabel);
     chrome.runtime.sendMessage({ action: 'clearCookiesAndRefresh' }, () => {
         if (chrome.runtime.lastError) {
             console.warn('[CS] clearCookiesAndRefresh:', chrome.runtime.lastError.message);
@@ -2253,7 +2832,6 @@ async function delayUnblockedMs(targetUnblockedMs, pollMs = 1000) {
 const BACKOFF_UNBLOCKED_MS_AFTER_REFRESH_BLOCKED = 15 * 1000;
 
 async function waitForEventTabReload(timeoutMs = EVENT_TAB_RELOAD_TIMEOUT_MS) {
-    console.log('[CS] Waiting for event tab to set eventTabReloaded after load (max ' + (timeoutMs / 1000) + 's)...');
     const startTime = Date.now();
     const checkInterval = 1000; // Check every 1 second
 
@@ -2306,18 +2884,13 @@ async function refreshEventTabSendOnly() {
         if (!pauseActiveLogged) {
             console.log('[CS] error403 pause is active — seat checks and event tab refresh paused until it ends (' + remainSec + 's remaining).');
             pauseActiveLogged = true;
-        } else {
-            console.log('[CS] Waiting to refresh event tab due to error403 pause (' + remainSec + 's remaining).');
         }
         return false;
     }
     await chrome.storage.local.set({ eventTabReloaded: false });
-    console.log('[CS] Sending refresh event tab message (event tab will set eventTabReloaded when loaded with verification token).');
-    chrome.runtime.sendMessage({ action: 'refreshEventTab' }, (response) => {
+    chrome.runtime.sendMessage({ action: 'refreshEventTab' }, () => {
         if (chrome.runtime.lastError) {
             console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
-        } else {
-            console.log('[CS] refreshEventTab response:', response);
         }
     });
     return true;

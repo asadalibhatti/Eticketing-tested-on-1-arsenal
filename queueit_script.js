@@ -7,7 +7,6 @@ const RECAPTCHA_SOLVE_TIMEOUT_MS = 30000;
 const RECAPTCHA_SOLVE_TIMEOUT_PEOPLE_AHEAD_MS = 180000; // ~3 minutes
 const NO_RECAPTCHA_IFRAME_REDIRECT_SEC = 50;
 const NO_RECAPTCHA_IFRAME_REDIRECT_PEOPLE_AHEAD_SEC = 180; // ~3 minutes
-const QUEUE_PAGE_PAUSE_CLEAR_DELAY_MS = 60000; // clear error403 pause after staying 60s on main queue page
 
 /** Returns true if the page shows \"people ahead of you\", the main queue progress bar, or the \"Your queue position will be updated in:\" warning box (user is in queue and must wait). */
 function hasPeopleAheadOfYouVisible() {
@@ -92,12 +91,29 @@ let joinWaitingRoomButtonClicked = false; // track if "Join waiting room" button
 let confirmRedirectButtonClicked = false; // track if "Yes, please" confirm redirect button was clicked
 let getNewPlaceInQueueClicked = false; // track if "Get a new place in the queue" link was clicked
 let confirmVisitorPresenceClicked = false; // "Yes, I'm here" (#buttonConfirmVisitorPresence)
-let captchaCodeLabelHandled = false; // track if "Enter the code from the picture" label was handled (legacy: close tab after 60s)
+let captchaCodeLabelHandled = false; // legacy flag; BotDetect handling uses appearance count below
 let browsingPausedUntil = 0; // when \"Your browsing activity has been paused\" was seen; back off actions for 60s
+/** After this many BotDetect appearances during URL recovery, solve via 2captcha instead of rotating URLs. */
+const BOTDETECT_CAPTCHA_2CAPTCHA_THRESHOLD = 3;
+const HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY = 'hdQueueBotDetectCaptchaCount';
+let hdQueueRecoveryTriggered = false; // captcha/error403 handled once per page state
+/** Count BotDetect once per page load (persisted count spans recovery navigations). */
+let botDetectAppearanceCountedThisPage = false;
 /** Softblock BotDetect + 2captcha: only start one BG solve per load; gotResponse clears "wait for API" for manual fallback. */
 let softblock2CaptchaStarted = false;
 let softblock2CaptchaGotResponse = false;
 let botdetectManualListenerAttached = false;
+
+function triggerHdQueueRecoverySequence(reason) {
+    if (hdQueueRecoveryTriggered) return;
+    hdQueueRecoveryTriggered = true;
+    console.log('[QueueIt Script] Triggering hd-queue recovery sequence:', reason);
+    chrome.runtime.sendMessage({ action: 'error403Detected', fromHdQueueError403: true }, () => {
+        if (chrome.runtime.lastError) {
+            console.error('[QueueIt Script] error403Detected error:', chrome.runtime.lastError);
+        }
+    });
+}
 
 function isSoftblockQueueUrl() {
     const u = window.location.href || '';
@@ -145,62 +161,81 @@ function showCaptchaSolutionFieldStatus(el, text) {
 }
 
 if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || window.location.href.startsWith("http://hd-queue.eticketing.co.uk")) {
-    // If we're on the error403 page: BG pause + 6 minutes on this URL, then history.back() to queue; pause ends on main queue URL.
+    // Save full softblock URL (including query) for recovery when /error403 happens.
+    if (isSoftblockQueueUrl() && window.location.href.indexOf('/softblock/?c') !== -1) {
+        chrome.runtime.sendMessage({ action: 'saveHdQueueSoftblockUrl', url: window.location.href }, () => {
+            if (chrome.runtime.lastError) {
+                console.warn('[QueueIt Script] saveHdQueueSoftblockUrl failed:', chrome.runtime.lastError.message);
+            } else {
+                console.log('[QueueIt Script] Saved softblock URL for error403 recovery.');
+            }
+        });
+    }
+
+    // hd-queue /error403: background sets pause (5,7,9,… min capped 30); timer ends pause, clears cookies, closes this tab.
     if (window.location.href.indexOf('error403') !== -1) {
-        const SIX_MIN_MS = 6 * 60 * 1000;
         if (!window.__hdQueueError403FlowScheduled) {
-            const pauseEndsAtMs = Date.now() + SIX_MIN_MS;
-            const pauseEndsAtStr = new Date(pauseEndsAtMs).toLocaleTimeString();
-            console.log(
-                '[QueueIt Script] hd-queue /error403 page detected — BG pause + 6 min on page, then history.back(). Pause ends at ' +
-                    pauseEndsAtStr +
-                    '.'
-            );
             window.__hdQueueError403FlowScheduled = true;
             chrome.runtime.sendMessage({ action: 'error403Detected', fromHdQueueError403: true }, () => {
                 if (chrome.runtime.lastError) {
                     console.error('[QueueIt Script] error403Detected error:', chrome.runtime.lastError);
                 }
             });
-            console.log(
-                '[QueueIt Script] Staying on error403 until ' +
-                    pauseEndsAtStr +
-                    ', then history.back() to return to queue…'
-            );
-            setTimeout(() => {
-                try {
-                    console.log('[QueueIt Script] 6 minutes elapsed — calling history.back() (expect hd-queue queue page).');
-                    window.history.back();
-                } catch (e) {
-                    console.warn('[QueueIt Script] history.back failed:', e);
+            console.log('[QueueIt Script] hd-queue /error403 — notified background (pause ladder); showing wait countdown.');
+            (function injectError403PauseCountdown() {
+                if (document.getElementById('etk-hd403-pause-banner')) return;
+                const el = document.createElement('div');
+                el.id = 'etk-hd403-pause-banner';
+                el.setAttribute(
+                    'style',
+                    'position:fixed;top:0;left:0;right:0;z-index:2147483646;padding:10px 14px;text-align:center;' +
+                        'font:14px/1.35 Segoe UI,system-ui,sans-serif;background:#1e293b;color:#f8fafc;' +
+                        'box-shadow:0 2px 12px rgba(0,0,0,.25);pointer-events:none'
+                );
+                document.documentElement.appendChild(el);
+                let tickTimer = null;
+                function formatRemain(ms) {
+                    if (ms <= 0) return 'Pause ending…';
+                    const s = Math.ceil(ms / 1000);
+                    const m = Math.floor(s / 60);
+                    const r = s % 60;
+                    return m > 0 ? m + 'm ' + r + 's remaining' : r + 's remaining';
                 }
-            }, SIX_MIN_MS);
+                function tick() {
+                    chrome.storage.local.get(['error403PauseUntil', 'currentStatus'], (st) => {
+                        if (chrome.runtime.lastError) return;
+                        const until = Number(st.error403PauseUntil) || 0;
+                        const left = until - Date.now();
+                        const status = String(st.currentStatus || '').trim().toLowerCase();
+                        if (left <= 0 && (status === 'off' || status === 'stop' || status === 'false' || status === '0')) {
+                            el.textContent = 'Error 403 pause ended — Google Sheet status is Off, waiting until it turns On.';
+                            return;
+                        }
+                        el.textContent = 'Error 403 pause — ' + formatRemain(left);
+                    });
+                }
+                tick();
+                tickTimer = setInterval(tick, 1000);
+                try {
+                    chrome.storage.onChanged.addListener(function etk403Storage(changes, area) {
+                        if (area !== 'local' || !changes.error403PauseUntil) return;
+                        tick();
+                    });
+                } catch (_) {}
+                window.addEventListener(
+                    'beforeunload',
+                    function () {
+                        if (tickTimer) clearInterval(tickTimer);
+                    },
+                    { once: true }
+                );
+            })();
         } else {
-            console.log('[QueueIt Script] hd-queue /error403 — 6 min wait + history.back() already scheduled for this tab.');
+            console.log('[QueueIt Script] hd-queue /error403 — flow already started for this tab.');
         }
         // Do not start queue checks, 120s timeout, or sendQueueWaiting while on /error403
     } else {
     console.log("[QueueIt Script] Running on the correct page.");
-
-        if (!window.__queuePauseClearScheduled) {
-            window.__queuePauseClearScheduled = true;
-            const clearAtStr = new Date(Date.now() + QUEUE_PAGE_PAUSE_CLEAR_DELAY_MS).toLocaleTimeString();
-            console.log(
-                '[QueueIt Script] Main queue page detected — will clear error403 pause after 60s at ' +
-                    clearAtStr +
-                    '.'
-            );
-            setTimeout(() => {
-                chrome.runtime.sendMessage({ action: 'error403QueueReturnedClearPause' }, () => {
-                    if (chrome.runtime.lastError) {
-                        /* ignore — no listener if BG sleeping */
-                    }
-                });
-                console.log('[QueueIt Script] 60s on queue page elapsed — requested error403 pause clear.');
-            }, QUEUE_PAGE_PAUSE_CLEAR_DELAY_MS);
-        } else {
-            console.log('[QueueIt Script] Queue pause-clear timer already scheduled for this tab.');
-        }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', startQueueItScript);
@@ -227,8 +262,8 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
         console.log("[QueueIt Script] Starting queue-it script...");
 
         let checkCount = 0;
-        /** Softblock can sit through many 2captcha rounds without reload — allow long run; other queue pages keep a short cap. */
-        const maxChecks = isSoftblockQueueUrl() ? 36000 : 200;
+        /** Softblock / 2captcha can sit through many rounds without reload — allow long run; other queue pages keep a short cap. */
+        let maxChecks = isSoftblockQueueUrl() ? 36000 : 200;
         let recaptchaTimeout;
         const startTime = Date.now();
         let iframeFound = false;
@@ -239,6 +274,7 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
         let lastSoftblockCaptchaImgSrc = null;
         /** After a 2captcha error, wait before retrying the same image (avoid hammering API). */
         let softblock2CaptchaRetryAfterMs = 0;
+        let botDetectCaptchaResetOnQueueProgress = false;
 
         const checkElements = setInterval(async () => {
             checkCount++;
@@ -265,8 +301,62 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 return; // skip this iteration; do nothing while paused
             }
 
+            // Past BotDetect into real queue — reset appearance counter for future recoveries
+            if (hasPeopleAheadOfYouVisible() && !botDetectCaptchaResetOnQueueProgress) {
+                botDetectCaptchaResetOnQueueProgress = true;
+                chrome.storage.local.set({ [HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]: 0 }, () => {
+                    if (!chrome.runtime.lastError) {
+                        console.log('[QueueIt Script] BotDetect captcha count reset (queue progress visible)');
+                    }
+                });
+            }
+
+            const captchaImgEarly = document.querySelector('img.captcha-code');
+            const captchaInEarly = document.querySelector('input#solution');
+            const submitBtnEarly = findBotdetectImNotRobotButton();
+            const labelEarly = document.querySelector('label#captcha-code-label[for="CaptchaCode"]');
+            const labelOkEarly =
+                labelEarly &&
+                (labelEarly.textContent || '').indexOf('Enter the code from the picture') !== -1;
+            const hasBotDetectUi = !!(captchaImgEarly && captchaInEarly && submitBtnEarly && labelOkEarly);
+
+            let allowAuto2Captcha = false;
+            if (hasBotDetectUi) {
+                if (!botDetectAppearanceCountedThisPage) {
+                    botDetectAppearanceCountedThisPage = true;
+                    captchaCodeLabelHandled = true;
+                    const prev = await chrome.storage.local.get([HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]);
+                    const n = (Number(prev[HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]) || 0) + 1;
+                    await chrome.storage.local.set({ [HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]: n });
+                    console.log(
+                        '[QueueIt Script] BotDetect captcha appearance #' +
+                            n +
+                            ' (2captcha after ' +
+                            BOTDETECT_CAPTCHA_2CAPTCHA_THRESHOLD +
+                            ')'
+                    );
+                    if (n < BOTDETECT_CAPTCHA_2CAPTCHA_THRESHOLD) {
+                        clearInterval(checkElements);
+                        triggerHdQueueRecoverySequence(
+                            'BotDetect captcha appearance ' + n + '/' + BOTDETECT_CAPTCHA_2CAPTCHA_THRESHOLD
+                        );
+                        return;
+                    }
+                    console.log(
+                        '[QueueIt Script] BotDetect appeared ' +
+                            n +
+                            '+ times during URL recovery — solving with 2captcha'
+                    );
+                    maxChecks = Math.max(maxChecks, 36000);
+                }
+                const stCount = await chrome.storage.local.get([HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]);
+                allowAuto2Captcha =
+                    (Number(stCount[HD_QUEUE_BOTDETECT_CAPTCHA_COUNT_KEY]) || 0) >=
+                    BOTDETECT_CAPTCHA_2CAPTCHA_THRESHOLD;
+            }
+
             let twoCaptchaKey = '';
-            if (isSoftblockQueueUrl()) {
+            if (allowAuto2Captcha) {
                 const st = await chrome.storage.local.get(['twoCaptchaApiKey']);
                 twoCaptchaKey = (st.twoCaptchaApiKey || '').trim();
                 if (!softblockTwoCaptchaSheetSyncSent) {
@@ -285,8 +375,8 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 }
             }
 
-            // --- Softblock: new captcha image without full reload (src changes) — allow another 2captcha round ---
-            if (isSoftblockQueueUrl() && twoCaptchaKey && !softblock2CaptchaStarted) {
+            // --- New captcha image without full reload (src changes) — allow another 2captcha round ---
+            if (allowAuto2Captcha && twoCaptchaKey && !softblock2CaptchaStarted) {
                 const imgProbe = document.querySelector('img.captcha-code');
                 const curSrc = imgProbe && imgProbe.src ? imgProbe.src : '';
                 if (
@@ -300,9 +390,9 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 }
             }
 
-            // --- Softblock: solve BotDetect image via 2captcha (key from storage or BG fetches from sheet) ---
+            // --- Solve BotDetect image via 2captcha (after 3+ appearances during URL recovery) ---
             if (
-                isSoftblockQueueUrl() &&
+                allowAuto2Captcha &&
                 twoCaptchaKey &&
                 !softblock2CaptchaStarted &&
                 !softblock2CaptchaGotResponse &&
@@ -320,7 +410,7 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                         softblock2CaptchaStarted = true;
                         showCaptchaSolutionFieldStatus(captchaIn, 'Solving...');
                         console.log(
-                            '[QueueIt Script] Softblock BotDetect image — sending to 2captcha (base64 length ' +
+                            '[QueueIt Script] BotDetect image — sending to 2captcha (base64 length ' +
                                 b64.length +
                                 ')...'
                         );
@@ -466,29 +556,18 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 }
             }
 
-            // --- "Enter the code from the picture": never auto-close tab on softblock (sheet + 2captcha); other queue pages keep 60s legacy ---
+            // --- BotDetect label: counted above; only recover if somehow not counted yet and under threshold ---
             if (!captchaCodeLabelHandled) {
                 const captchaCodeLabel = document.querySelector('label#captcha-code-label[for="CaptchaCode"]');
                 const hasLabelText =
                     captchaCodeLabel &&
                     (captchaCodeLabel.textContent || '').trim().indexOf('Enter the code from the picture') !== -1;
                 if (hasLabelText) {
-                    const skipLegacyClose = isSoftblockQueueUrl();
-                    if (!skipLegacyClose) {
-                        captchaCodeLabelHandled = true;
+                    captchaCodeLabelHandled = true;
+                    if (!allowAuto2Captcha) {
                         clearInterval(checkElements);
-                        console.log(
-                            "[QueueIt Script] 'Enter the code from the picture' — waiting 60s then refreshing event tab and closing queue tab."
-                        );
-                        setTimeout(() => {
-                            chrome.runtime.sendMessage({ action: 'refreshEventTabAndCloseQueueTab' }, () => {
-                                if (chrome.runtime.lastError)
-                                    console.error(
-                                        '[QueueIt Script] refreshEventTabAndCloseQueueTab error:',
-                                        chrome.runtime.lastError
-                                    );
-                            });
-                        }, 60000);
+                        triggerHdQueueRecoverySequence('BotDetect captcha label detected');
+                        return;
                     }
                 }
             }
@@ -499,33 +578,15 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
 
             // --- Detect reCAPTCHA iframe ---
             if (recaptchaIframe) {
-                if (!iframeFound) console.log("[QueueIt Script] reCAPTCHA challenge detected, waiting for auto-solve...");
+                if (!iframeFound) console.log("[QueueIt Script] reCAPTCHA challenge detected - using hd-queue recovery sequence.");
                 iframeFound = true;
-
-                if (recaptchaTimeout) clearTimeout(recaptchaTimeout);
-                const recaptchaMs = hasPeopleAheadOfYouVisible()
-                    ? RECAPTCHA_SOLVE_TIMEOUT_PEOPLE_AHEAD_MS
-                    : RECAPTCHA_SOLVE_TIMEOUT_MS;
-                recaptchaTimeout = setTimeout(async () => {
-                    if (hasPeopleAheadOfYouVisible()) {
-                        console.log("[QueueIt Script] reCAPTCHA timeout reached but people ahead / queue UI visible — skipping event tab refresh.");
-                        return;
-                    }
-                    console.log("[QueueIt Script] reCAPTCHA not solved in time. Refreshing event tab...");
                     clearInterval(checkElements);
-
-                    chrome.runtime.sendMessage({action: 'refreshEventTab'}, response => {
-                        if (chrome.runtime.lastError) {
-                            console.error('[CS] refreshEventTab error:', chrome.runtime.lastError);
-                        } else {
-                            console.log('[CS] refreshEventTab response:', response);
-                        }
-                    });
-                }, recaptchaMs);
+                triggerHdQueueRecoverySequence('reCAPTCHA iframe detected');
+                return;
             }
 
-            // --- If iframe not found within N seconds, redirect to event URL (softblock uses BotDetect only — skip this) ---
-            if (!iframeFound && !cookiesCleared && !isSoftblockQueueUrl()) {
+            // --- If iframe not found within N seconds, redirect to event URL (softblock / 2captcha BotDetect — skip this) ---
+            if (!iframeFound && !cookiesCleared && !isSoftblockQueueUrl() && !allowAuto2Captcha) {
                 const needSec = hasPeopleAheadOfYouVisible()
                     ? NO_RECAPTCHA_IFRAME_REDIRECT_PEOPLE_AHEAD_SEC
                     : NO_RECAPTCHA_IFRAME_REDIRECT_SEC;
@@ -543,36 +604,44 @@ if (window.location.href.startsWith("https://hd-queue.eticketing.co.uk") || wind
                 }
             }
 
-            // --- Manual BotDetect: defer briefly on softblock while sheet/key load or 2captcha request is in flight ---
+            // --- Manual BotDetect: defer while 2captcha request is in flight (after threshold) ---
             const sheetSyncGraceMs = 25000;
             const sheetSyncGrace =
-                isSoftblockQueueUrl() &&
+                allowAuto2Captcha &&
                 softblockTwoCaptchaSheetSyncSent &&
                 Date.now() - softblockSheetSyncSentAt < sheetSyncGraceMs;
             const waitOnSoftblock2Captcha =
-                isSoftblockQueueUrl() &&
+                allowAuto2Captcha &&
                 !softblock2CaptchaGotResponse &&
                 (twoCaptchaKey || softblock2CaptchaStarted || sheetSyncGrace);
-            // Softblock + 2captcha key: never stop the interval for a one-shot manual listener — new captcha images need ticks.
-            const skipManualBotdetect =
-                isSoftblockQueueUrl() && twoCaptchaKey;
+            // With 2captcha key: never stop the interval for a one-shot manual listener — new captcha images need ticks.
+            const skipManualBotdetect = allowAuto2Captcha && twoCaptchaKey;
+            if (
+                allowAuto2Captcha &&
+                !twoCaptchaKey &&
+                softblockTwoCaptchaSheetSyncSent &&
+                Date.now() - softblockSheetSyncSentAt >= sheetSyncGraceMs &&
+                !hdQueueRecoveryTriggered
+            ) {
+                console.warn(
+                    '[QueueIt Script] 2captcha key still missing after sheet sync — falling back to URL recovery'
+                );
+                clearInterval(checkElements);
+                triggerHdQueueRecoverySequence('BotDetect 2captcha key missing');
+                return;
+            }
             if (
                 captchaInput &&
                 imNotRobotBtn &&
                 !botdetectManualListenerAttached &&
                 !waitOnSoftblock2Captcha &&
-                !skipManualBotdetect
+                !skipManualBotdetect &&
+                !allowAuto2Captcha
             ) {
-                console.log("[QueueIt Script] BotDetect captcha input + I'm not a robot — attaching manual submit listener.");
-                botdetectManualListenerAttached = true;
+                console.log("[QueueIt Script] BotDetect captcha input detected - using hd-queue recovery sequence.");
                 clearInterval(checkElements);
-
-                captchaInput.addEventListener('input', () => {
-                    if (captchaInput.value.trim() !== '') {
-                        console.log("[QueueIt Script] Captcha input filled. Clicking I'm not a robot...");
-                        imNotRobotBtn.click();
-                    }
-                });
+                triggerHdQueueRecoverySequence('BotDetect captcha input/button detected');
+                return;
             }
         }, 1000);
     }

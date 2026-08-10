@@ -1,5 +1,17 @@
 // content-script.js
 console.log("requestVerification script loaded, on", location.href);
+
+function isBrowsingActivityPausedForTokenScript() {
+    const title = (document.title || '').toLowerCase();
+    if (title.includes('your browsing activity')) return true;
+    try {
+        const bodyText = (document.body && (document.body.innerText || document.body.textContent) || '').toLowerCase();
+        if (bodyText.includes('your browsing activity has been paused')) return true;
+        if (bodyText.includes('your browsing activity has')) return true;
+    } catch (_) {}
+    return false;
+}
+
 if (window.location.pathname.includes("/EDP/Event/Index/")) {
 
     console.log("[CS] Reloading page after 120 minutes interval.");
@@ -7,31 +19,12 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
 
     //wait for 5 seconds
     console.log("[CS] Event page detected. Waiting for 5 seconds before proceeding...");
-    // setTimeout(() => {
-    //     console.log("[CS] 5 seconds passed. Proceeding with verification token extraction.");
-    //
-    // } , 5000);
 
-    //it current tab title is "Your Browsing Activity has" than wait for 10 seconds and keep checking
-    // if title changes else reload it after 10 seconds
-    if (document.title.includes("Your Browsing Activity Has")) {
-        console.log("[CS] Waiting for tab title to change...");
-        let checkTitleInterval = setInterval(() => {
-            if (!document.title.includes("Your Browsing Activity has")) {
-                clearInterval(checkTitleInterval);
-                console.log("[CS] Tab title changed. Proceeding with verification token extraction.");
-            } else {
-                console.log("[CS] Still waiting for tab title to change...");
-            }
-        }, 1000);
-
-        setTimeout(() => {
-            if (document.title.includes("Your Browsing Activity has")) {
-                console.warn("[CS] Tab title did not change within 10 seconds. Reloading the page...");
-                window.location.reload();
-            }
-        }, 10000);
-    }
+    // Browsing-pause recovery (60s → reload; after 3 reloads → cookies) is handled by content.js / background.
+    // Do not extract verification token while the pause page is showing.
+    if (isBrowsingActivityPausedForTokenScript()) {
+        console.warn("[CS] Browsing activity paused on event page — skipping verification token extraction until page recovers.");
+    } else
     (function () {
         const TOKEN_KEY = "verification_token";
         const EMAIL_KEY = "user_email";
@@ -75,9 +68,12 @@ if (window.location.pathname.includes("/EDP/Event/Index/")) {
             if (token) {
                 localStorage.setItem(TOKEN_KEY, token);
                 console.log("[CS] Token saved to localStorage");
-                // Signal to content script that event tab has loaded and verification token is ready (so next seat API can run)
-                chrome.storage.local.set({ eventTabReloaded: true });
-                console.log("[CS] Event tab reload flag set (eventTabReloaded=true) — page loaded with token.");
+                // Signal that event tab has loaded and verification token is ready
+                // eventTabReloaded: one-shot for seat-check wait; eventPageReady: durable gate for validation tab
+                chrome.storage.local.set({ eventTabReloaded: true, eventPageReady: true });
+                console.log(
+                    '[CS] Event tab ready flags set (eventTabReloaded=true, eventPageReady=true) — page loaded with token.'
+                );
                 chrome.runtime.sendMessage({ action: 'scheduleCloseEventTabAfterToken', delayMs: 5000 }, () => {
                     if (chrome.runtime.lastError) {
                         console.warn('[CS] scheduleCloseEventTabAfterToken:', chrome.runtime.lastError.message);
