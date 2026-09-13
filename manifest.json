@@ -11,6 +11,7 @@
     "activeTab",
     "management",
     "cookies",
+    "browsingData",
     "alarms"
   ],
   "host_permissions": [
@@ -44,6 +45,16 @@
       "js": [
         "content.js"
       ]
+    },
+    {
+      "matches": [
+        "https://web-identity.tmtickets.co.uk/*",
+        "http://web-identity.tmtickets.co.uk/*"
+      ],
+      "js": [
+        "browsing_pause_detect_content.js"
+      ],
+      "run_at": "document_idle"
     },
     {
       "matches": ["https://myaccount.arsenal.com/login*"],

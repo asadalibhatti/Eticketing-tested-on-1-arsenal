@@ -1,76 +1,59 @@
 // login_nottingham_forest_content.js
+// Works on https://login.nottinghamforest.co.uk/auth/login (Shoelace sl-input + ALTCHA onsubmit)
 console.log('[LOGIN] Nottingham Forest login content script loaded on', location.href);
 
-// Check if we're on the correct Nottingham Forest login page
-(function() {
-    if (!window.location.href.includes('login.nottinghamforest.co.uk')) {
-        console.warn('[LOGIN] Not on Nottingham Forest login page, stopping script execution');
+(function () {
+    const href = window.location.href.toLowerCase();
+    if (!href.includes('login.nottinghamforest.co.uk')) {
+        console.warn('[LOGIN] Not on Nottingham Forest login host, stopping');
         return;
     }
-    
+    // Prefer /auth/login pages; still allow other login paths under this host
+    if (!href.includes('/auth/login') && !href.includes('/auth/login?')) {
+        // Older paths may still land here; continue if login form exists later
+        console.log('[LOGIN] URL is not /auth/login — will still try if login form appears');
+    }
+
     console.log('[LOGIN] Nottingham Forest login page detected, starting login automation...');
-    console.log('[LOGIN] Current page URL:', window.location.href);
-    console.log('[LOGIN] Page title:', document.title);
-    console.log('[LOGIN] Document ready state:', document.readyState);
-    
-    // Configuration object for login handling
+
     let loginConfig = {
         running: false,
         maxRetries: 3,
         retryCount: 0
     };
-    
-    // Message listener for communication with background script
+
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-        console.log('[LOGIN] Received message:', msg);
-        
         if (msg.action === 'startLogin') {
-            console.log('[LOGIN] Starting login process...');
-            startLoginProcess().catch(e => {
-                console.error('[LOGIN] Login process error:', e);
-            });
+            startLoginProcess().catch((e) => console.error('[LOGIN] Login process error:', e));
         }
-        
         if (msg.action === 'stopLogin') {
-            console.log('[LOGIN] Stopping login process...');
             stopLoginProcess();
         }
-        
         return true;
     });
-    
-    // Auto-start login process with retry mechanism
+
     (async () => {
         try {
-            console.log('[LOGIN] Auto-starting login process...');
             await startLoginProcess();
         } catch (e) {
             console.error('[LOGIN] Auto-start error:', e);
-            // Retry after a delay if the form wasn't found
-            if (e.message.includes('form elements not found')) {
-                console.log('[LOGIN] Retrying login process after 5 seconds...');
-                setTimeout(async () => {
-                    try {
-                        await startLoginProcess();
-                    } catch (retryError) {
-                        console.error('[LOGIN] Retry failed:', retryError);
-                    }
+            if (String(e && e.message || '').includes('form elements not found')) {
+                setTimeout(() => {
+                    startLoginProcess().catch((retryError) =>
+                        console.error('[LOGIN] Retry failed:', retryError)
+                    );
                 }, 5000);
             }
         }
     })();
-    
+
     async function startLoginProcess() {
         if (loginConfig.running) {
             console.log('[LOGIN] Login process already running');
             return;
         }
-        
         loginConfig.running = true;
         loginConfig.retryCount = 0;
-        
-        console.log('[LOGIN] Starting login process...');
-        
         try {
             await performLogin();
         } catch (e) {
@@ -78,252 +61,227 @@ console.log('[LOGIN] Nottingham Forest login content script loaded on', location
             loginConfig.running = false;
         }
     }
-    
+
     function stopLoginProcess() {
         loginConfig.running = false;
         console.log('[LOGIN] Login process stopped');
     }
-    
+
     async function getLoginCredentials() {
-        console.log('[LOGIN] Retrieving login credentials from Google Sheets...');
-        
-        // First, try to get credentials from local storage
-        const { loginEmail, loginPassword, currentStatus } = await chrome.storage.local.get(['loginEmail', 'loginPassword', 'currentStatus']);
-        
+        const { loginEmail, loginPassword, currentStatus } = await chrome.storage.local.get([
+            'loginEmail',
+            'loginPassword',
+            'currentStatus'
+        ]);
         if (loginEmail && loginPassword) {
-            console.log('[LOGIN] Found credentials in local storage from Google Sheets');
             return { email: loginEmail, password: loginPassword };
         }
-        
-        // If no credentials found, check if the system is active
         if (currentStatus !== 'on') {
-            throw new Error('System is not active. Please ensure your Google Sheet has a row with status "on" and matching startSecond.');
+            throw new Error('System is not active. Ensure Google Sheet status is on.');
         }
-        
-        // Request background script to refresh credentials from Google Sheets
-        console.log('[LOGIN] No credentials found, requesting background script to refresh from Google Sheets...');
-        
-        try {
-            // Send message to background script to refresh credentials
-            const response = await new Promise((resolve, reject) => {
-                chrome.runtime.sendMessage({ action: 'refreshCredentials' }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        reject(new Error(chrome.runtime.lastError.message));
-                    } else {
-                        resolve(response);
-                    }
-                });
+        const response = await new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage({ action: 'refreshCredentials' }, (resp) => {
+                if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+                else resolve(resp);
             });
-            
-            if (response && response.success) {
-                // Try again to get credentials after refresh
-                const { loginEmail: refreshedEmail, loginPassword: refreshedPassword } = await chrome.storage.local.get(['loginEmail', 'loginPassword']);
-                
-                if (refreshedEmail && refreshedPassword) {
-                    console.log('[LOGIN] Successfully retrieved credentials after refresh');
-                    return { email: refreshedEmail, password: refreshedPassword };
-                }
+        });
+        if (response && response.success) {
+            const refreshed = await chrome.storage.local.get(['loginEmail', 'loginPassword']);
+            if (refreshed.loginEmail && refreshed.loginPassword) {
+                return { email: refreshed.loginEmail, password: refreshed.loginPassword };
             }
-        } catch (error) {
-            console.warn('[LOGIN] Failed to refresh credentials from background script:', error);
         }
-        
-        // Final fallback - throw error
-        throw new Error('Login credentials not available from Google Sheets. Please check:\n1. Your Google Sheet has a row with status "on"\n2. The row has valid loginEmail and loginPassword columns\n3. The startSecond matches your configuration\n4. The Google Sheet URL is correctly configured');
+        throw new Error('Login credentials not available from Google Sheets.');
     }
-    
+
+    /** Find Shoelace / classic email+password+submit for Forest login. */
+    function findLoginControls() {
+        const form =
+            document.querySelector('form#authForm') ||
+            document.querySelector('#login-field form') ||
+            document.querySelector('form.validity-styles') ||
+            document.querySelector('.login-view form#authForm');
+
+        const emailSl =
+            document.querySelector('sl-input[name="email"]') ||
+            document.querySelector('#login-field sl-input[type="email"]') ||
+            document.querySelector('form#authForm sl-input[name="email"]');
+        const passwordSl =
+            document.querySelector('sl-input[name="password"]') ||
+            document.querySelector('#login-field sl-input[type="password"]') ||
+            document.querySelector('form#authForm sl-input[name="password"]');
+
+        const emailNative =
+            document.querySelector('input[name="email"][type="email"]') ||
+            document.querySelector('#Email, input[name="Email"], input[type="email"]');
+        const passwordNative =
+            document.querySelector('input[name="password"][type="password"]') ||
+            document.querySelector('#Password, input[name="Password"], input[type="password"]');
+
+        const submitButton =
+            document.querySelector('#submitForm') ||
+            document.querySelector('input[type="submit"][value="Log in"]') ||
+            document.querySelector('form#authForm input[type="submit"]') ||
+            document.querySelector('input.signin-btn, button.signin-btn');
+
+        return {
+            form,
+            emailInput: emailSl || emailNative,
+            passwordInput: passwordSl || passwordNative,
+            submitButton,
+            usesShoelace: !!(emailSl && passwordSl)
+        };
+    }
+
+    function setControlValue(el, value) {
+        if (!el) return;
+        try {
+            el.value = value;
+        } catch (_) {}
+        // Shoelace: also set attribute + fire events that update validity
+        try {
+            if (el.tagName && el.tagName.toLowerCase() === 'sl-input') {
+                el.setAttribute('value', value);
+                if (typeof el.focus === 'function') el.focus();
+            }
+        } catch (_) {}
+        try {
+            el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        } catch (_) {}
+        // Shadow native input if present
+        try {
+            const inner = el.shadowRoot && el.shadowRoot.querySelector('input');
+            if (inner) {
+                inner.value = value;
+                inner.dispatchEvent(new Event('input', { bubbles: true }));
+                inner.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } catch (_) {}
+    }
+
+    async function waitForLoginForm() {
+        const maxWaitTime = 30000;
+        const checkInterval = 500;
+        let elapsed = 0;
+        return new Promise((resolve, reject) => {
+            const tick = () => {
+                elapsed += checkInterval;
+                const c = findLoginControls();
+                if (c.emailInput && c.passwordInput && c.submitButton) {
+                    console.log(
+                        '[LOGIN] Form ready after',
+                        elapsed / 1000,
+                        's (shoelace=',
+                        c.usesShoelace,
+                        ')'
+                    );
+                    resolve(c);
+                    return;
+                }
+                if (elapsed % 5000 < checkInterval) {
+                    console.log(
+                        '[LOGIN] Waiting for form…',
+                        elapsed / 1000,
+                        's email=',
+                        !!c.emailInput,
+                        'pass=',
+                        !!c.passwordInput,
+                        'submit=',
+                        !!c.submitButton
+                    );
+                }
+                if (elapsed >= maxWaitTime) {
+                    reject(new Error('Login form elements not found after waiting for form to load'));
+                    return;
+                }
+                setTimeout(tick, checkInterval);
+            };
+            tick();
+        });
+    }
+
     async function performLogin() {
-        console.log('[LOGIN] Performing login...');
-        
-        // Wait for page to be fully loaded - increase timeout and try multiple selectors
-        console.log('[LOGIN] Waiting for login form to load...');
-        await waitForLoginForm();
-        
-        // Find login form elements - Nottingham Forest specific selectors
-        const emailInput = document.querySelector('#Email, input[name="Email"], input[type="email"], input[name="email"], input[name="username"]');
-        const passwordInput = document.querySelector('#Password, input[name="Password"], input[type="password"], input[name="password"]');
-        
-        // Try to find the specific Nottingham Forest submit button first, then fallback to generic selectors
-        let submitButton = document.querySelector('#submitForm, input[type="submit"][value="Log in"], button[type="submit"], input[type="submit"]');
-        
-        if (!emailInput || !passwordInput || !submitButton) {
-            console.error('[LOGIN] Login form elements not found after waiting');
-            console.log('[LOGIN] Email input found:', !!emailInput);
-            console.log('[LOGIN] Password input found:', !!passwordInput);
-            console.log('[LOGIN] Submit button found:', !!submitButton);
-            console.log('[LOGIN] Available inputs on page:', document.querySelectorAll('input'));
-            console.log('[LOGIN] Available buttons on page:', document.querySelectorAll('button'));
+        console.log('[LOGIN] Performing Nottingham Forest login…');
+        let controls = await waitForLoginForm();
+        await new Promise((r) => setTimeout(r, 800));
+        controls = findLoginControls();
+        if (!controls.emailInput || !controls.passwordInput || !controls.submitButton) {
             throw new Error('Login form elements not found after waiting for form to load');
         }
-        
-        console.log('[LOGIN] Login form elements found, checking for autofilled credentials...');
-        console.log('[LOGIN] Email input element:', emailInput);
-        console.log('[LOGIN] Password input element:', passwordInput);
-        console.log('[LOGIN] Submit button element:', submitButton);
-        console.log('[LOGIN] Submit button classes:', submitButton.className);
-        console.log('[LOGIN] Submit button text:', submitButton.value || submitButton.textContent);
-        console.log('[LOGIN] Submit button type:', submitButton.type);
-        console.log('[LOGIN] Email input type:', emailInput.type);
-        console.log('[LOGIN] Password input type:', passwordInput.type);
-        
-        // Wait a bit for autofill to complete
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
-        // Get login credentials from local storage (from Google Sheets)
+
         const credentials = await getLoginCredentials();
-        
-        console.log('[LOGIN] Using credentials from Google Sheets, filling form fields...');
-        const currentEmail = credentials.email;
-        const currentPassword = credentials.password;
-        
-        // Clear existing values first
-        try {
-            emailInput.value = '';
-            passwordInput.value = '';
-            console.log('[LOGIN] Cleared existing form values');
-        } catch (e) {
-            console.warn('[LOGIN] Error clearing form values:', e);
-        }
-        
-        // Wait a moment for fields to clear
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
-        // Fill in the specific credentials
-        try {
-            emailInput.value = currentEmail;
-            passwordInput.value = currentPassword;
-            console.log('[LOGIN] Filled form with credentials - Email:', currentEmail, 'Password length:', currentPassword.length);
-        } catch (e) {
-            console.error('[LOGIN] Error filling form values:', e);
-            throw e;
-        }
-        
-        // Comprehensive simulation of user interaction with email field
-        emailInput.focus();
-        await new Promise(resolve => setTimeout(resolve, 200));
-        emailInput.click();
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
-        // Trigger all possible events for email field
-        emailInput.dispatchEvent(new Event('focus', { bubbles: true, cancelable: true }));
-        emailInput.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        emailInput.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        emailInput.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
-        emailInput.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
-        emailInput.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        
-        await new Promise(resolve => setTimeout(resolve, 300));
-        
-        // Comprehensive simulation of user interaction with password field
-        passwordInput.focus();
-        await new Promise(resolve => setTimeout(resolve, 200));
-        passwordInput.click();
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
-        // Trigger all possible events for password field
-        passwordInput.dispatchEvent(new Event('focus', { bubbles: true, cancelable: true }));
-        passwordInput.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        passwordInput.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        passwordInput.dispatchEvent(new Event('keydown', { bubbles: true, cancelable: true }));
-        passwordInput.dispatchEvent(new Event('keyup', { bubbles: true, cancelable: true }));
-        passwordInput.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        
-        // Additional: Try to trigger form validation events
-        const form = emailInput.closest('form') || passwordInput.closest('form');
-        if (form) {
-            form.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-            form.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        }
-        
-        // Simulate clicking on the document/window to trigger global validation
-        document.body.click();
-        await new Promise(resolve => setTimeout(resolve, 300));
-        
-        // Try alternative method: simulate typing in the fields (without selection for email inputs)
-        emailInput.focus();
-        // Don't use select() or setSelectionRange() on email inputs as they don't support it
-        emailInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
-        emailInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }));
-        
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
-        passwordInput.focus();
-        // Only use select() and setSelectionRange() for password fields
-        try {
-            passwordInput.select();
-            passwordInput.setSelectionRange(0, currentPassword.length);
-        } catch (e) {
-            console.log('[LOGIN] Password field selection not supported, continuing...');
-        }
-        passwordInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
-        passwordInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }));
-        
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
-        // Try clicking on the form itself
-        if (form) {
-            form.click();
-            await new Promise(resolve => setTimeout(resolve, 300));
-        }
-        
-        // Final check: try to trigger validation by dispatching a custom event
-        const validationEvent = new CustomEvent('validation', { bubbles: true, cancelable: true });
-        emailInput.dispatchEvent(validationEvent);
-        passwordInput.dispatchEvent(validationEvent);
-        if (form) form.dispatchEvent(validationEvent);
-        
-        console.log('[LOGIN] Comprehensive user interaction simulated, submitting login form...');
-        
-        // Scroll to the submit button
-        submitButton.scrollIntoView({ behavior: 'smooth' });
+        console.log('[LOGIN] Filling credentials for', credentials.email);
 
-        // Wait longer for form validation to update
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Click submit button
+        setControlValue(controls.emailInput, '');
+        setControlValue(controls.passwordInput, '');
+        await new Promise((r) => setTimeout(r, 300));
+        setControlValue(controls.emailInput, credentials.email);
+        setControlValue(controls.passwordInput, credentials.password);
+
+        // Nudge validation / Shoelace internals
         try {
-            console.log('[LOGIN] Clicking submit button...');
-            submitButton.click();
-            console.log('[LOGIN] Submit button clicked successfully');
+            controls.emailInput.focus && controls.emailInput.focus();
+            controls.passwordInput.focus && controls.passwordInput.focus();
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, 400));
+
+        const form = controls.form || controls.emailInput.closest('form') || document.querySelector('form#authForm');
+        controls.submitButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await new Promise((r) => setTimeout(r, 500));
+
+        // ALTCHA is auto="onsubmit" — clicking Log in should trigger it; do not abort just because widget exists
+        console.log('[LOGIN] Clicking Log in (#submitForm)…');
+        try {
+            controls.submitButton.click();
         } catch (e) {
-            console.error('[LOGIN] Error clicking submit button:', e);
-            throw e;
+            console.warn('[LOGIN] submit click failed, trying form.requestSubmit:', e);
+            if (form && typeof form.requestSubmit === 'function') form.requestSubmit(controls.submitButton);
+            else if (form) form.submit();
         }
 
-        // Wait for navigation or error
         await waitForLoginResult();
     }
-    
+
     async function waitForLoginResult() {
-        console.log('[LOGIN] Waiting for login result...');
-        
-        const maxWaitTime = 90000; // 90 seconds (triple the previous 30 seconds)
-        const checkInterval = 2000; // Check every 2 seconds (less frequent checking)
+        console.log('[LOGIN] Waiting for login result…');
+        const maxWaitTime = 90000;
+        const checkInterval = 2000;
         let elapsed = 0;
-        
+
         return new Promise((resolve, reject) => {
             const checkTimer = setInterval(() => {
                 elapsed += checkInterval;
-                
-                // Check if we've been redirected to a success page (Nottingham Forest specific)
-                if (window.location.href.includes('nottinghamforest.co.uk') && 
-                    !window.location.href.includes('login.nottinghamforest.co.uk')) {
+                const loc = window.location.href.toLowerCase();
+
+                // Left the login host / auth login path → success
+                if (
+                    loc.includes('nottinghamforest.co.uk') &&
+                    !loc.includes('login.nottinghamforest.co.uk')
+                ) {
                     clearInterval(checkTimer);
                     console.log('[LOGIN] Login successful, redirected to:', window.location.href);
                     loginConfig.running = false;
                     resolve();
                     return;
                 }
-                
-                // Check for error messages
-                const errorElements = document.querySelectorAll('.error, .alert-error, .login-error, [class*="error"], .alert-danger, .text-danger, .field-validation-error');
-                if (errorElements.length > 0) {
-                    const errorText = Array.from(errorElements).map(el => el.textContent).join(' ');
+                if (loc.includes('login.nottinghamforest.co.uk') && !loc.includes('/auth/login')) {
+                    // e.g. redirected to another auth step that is not the login form
+                    console.log('[LOGIN] Navigated away from /auth/login:', window.location.href);
+                }
+
+                const errorElements = document.querySelectorAll(
+                    '.error, .alert-error, .login-error, .alert-danger, .text-danger, .field-validation-error, [class*="validation-summary"]'
+                );
+                const errorText = Array.from(errorElements)
+                    .map((el) => (el.textContent || '').trim())
+                    .filter(Boolean)
+                    .join(' ');
+                if (errorText && /invalid|incorrect|failed|error/i.test(errorText)) {
                     console.warn('[LOGIN] Login error detected:', errorText);
-                    
                     if (loginConfig.retryCount < loginConfig.maxRetries) {
                         loginConfig.retryCount++;
-                        console.log(`[LOGIN] Retrying login (attempt ${loginConfig.retryCount}/${loginConfig.maxRetries})...`);
+                        clearInterval(checkTimer);
                         setTimeout(() => {
                             performLogin().then(resolve).catch(reject);
                         }, 2000);
@@ -333,164 +291,54 @@ console.log('[LOGIN] Nottingham Forest login content script loaded on', location
                     }
                     return;
                 }
-                
-                // Check for CAPTCHA or verification challenges (ALTCHA widget)
-                if (document.querySelector('[class*="captcha"], [class*="recaptcha"], [class*="verification"], [class*="hcaptcha"], altcha-widget, [class*="altcha"]')) {
-                    console.log('[LOGIN] CAPTCHA or verification challenge detected (ALTCHA widget)');
-                    clearInterval(checkTimer);
-                    loginConfig.running = false;
-                    resolve(); // Don't fail, just stop and let user handle manually
-                    return;
+
+                // ALTCHA verifying — wait, do not treat as hard failure
+                const altcha = document.querySelector('altcha-widget');
+                if (altcha) {
+                    const state =
+                        (altcha.getAttribute('data-state') ||
+                            (altcha.shadowRoot &&
+                                altcha.shadowRoot.querySelector('.altcha') &&
+                                altcha.shadowRoot.querySelector('.altcha').getAttribute('data-state')) ||
+                            '') + '';
+                    if (/verifying/i.test(state)) {
+                        if (elapsed % 10000 < checkInterval) {
+                            console.log('[LOGIN] ALTCHA verifying…');
+                        }
+                    }
                 }
-                
-                // Log progress every 10 seconds
-                if (elapsed % 10000 === 0 && elapsed > 0) {
-                    console.log('[LOGIN] Still waiting for login result...', elapsed / 1000, 'seconds elapsed');
+
+                if (elapsed % 10000 < checkInterval && elapsed > 0) {
+                    console.log('[LOGIN] Still waiting…', elapsed / 1000, 's');
                 }
-                
-                // Timeout
                 if (elapsed >= maxWaitTime) {
                     clearInterval(checkTimer);
-                    console.log('[LOGIN] Login timeout after', maxWaitTime / 1000, 'seconds');
                     reject(new Error('Login timeout'));
-                    return;
                 }
             }, checkInterval);
         });
     }
-    
-    async function waitForLoginForm() {
-        console.log('[LOGIN] Waiting for login form elements to appear...');
-        
-        const maxWaitTime = 30000; // 30 seconds
-        const checkInterval = 1000; // Check every second
-        let elapsed = 0;
-        
-        return new Promise((resolve, reject) => {
-            const checkForForm = () => {
-                elapsed += checkInterval;
-                
-                // Check for form elements with multiple selectors
-                const emailInput = document.querySelector('#Email, input[name="Email"], input[type="email"], input[name="email"], input[name="username"]');
-                const passwordInput = document.querySelector('#Password, input[name="Password"], input[type="password"], input[name="password"]');
-                
-                // Try to find the specific Nottingham Forest submit button first, then fallback to generic selectors
-                let submitButton = document.querySelector('#submitForm, input[type="submit"][value="Log in"], button[type="submit"], input[type="submit"]');
-                
-                if (emailInput && passwordInput && submitButton) {
-                    console.log('[LOGIN] All login form elements found after', elapsed / 1000, 'seconds');
-                    console.log('[LOGIN] Email input:', emailInput);
-                    console.log('[LOGIN] Password input:', passwordInput);
-                    console.log('[LOGIN] Submit button:', submitButton);
-                    resolve();
-                    return;
-                }
-                
-                // Log progress every 5 seconds
-                if (elapsed % 5000 === 0) {
-                    console.log('[LOGIN] Still waiting for login form...', elapsed / 1000, 'seconds elapsed');
-                    console.log('[LOGIN] Found elements - Email:', !!emailInput, 'Password:', !!passwordInput, 'Submit:', !!submitButton);
-                }
-                
-                // Timeout
-                if (elapsed >= maxWaitTime) {
-                    console.error('[LOGIN] Login form timeout after', maxWaitTime / 1000, 'seconds');
-                    console.log('[LOGIN] Available form elements on page:');
-                    console.log('[LOGIN] All inputs:', document.querySelectorAll('input'));
-                    console.log('[LOGIN] All buttons:', document.querySelectorAll('button'));
-                    console.log('[LOGIN] All forms:', document.querySelectorAll('form'));
-                    reject(new Error(`Login form elements not found within ${maxWaitTime}ms`));
-                    return;
-                }
-                
-                // Continue checking
-                setTimeout(checkForForm, checkInterval);
-            };
-            
-            // Start checking
-            checkForForm();
-        });
-    }
-    
-    // Extract and store any authentication tokens or session data
+
     function extractAuthData() {
-        console.log('[LOGIN] Extracting authentication data...');
-        
-        // Look for common token patterns
-        const tokenPatterns = [
-            /__RequestVerificationToken["\s]*value=["']([^"']+)["']/,
-            /authToken["\s]*[:=]["']([^"']+)["']/,
-            /sessionToken["\s]*[:=]["']([^"']+)["']/,
-            /csrf["\s]*[:=]["']([^"']+)["']/,
-            /access_token["\s]*[:=]["']([^"']+)["']/,
-            /bearer["\s]*[:=]["']([^"']+)["']/
-        ];
-        
         const html = document.documentElement.innerHTML;
-        
-        for (const pattern of tokenPatterns) {
-            const match = html.match(pattern);
-            if (match) {
-                const token = match[1];
-                localStorage.setItem('nottingham_forest_auth_token', token);
-                console.log('[LOGIN] Authentication token extracted and stored');
-                return token;
-            }
+        const match = html.match(/__RequestVerificationToken["\s]*value=["']([^"']+)["']/);
+        if (match) {
+            localStorage.setItem('nottingham_forest_auth_token', match[1]);
+            return match[1];
         }
-        
-        // Check for cookies
-        const cookies = document.cookie.split(';').reduce((acc, cookie) => {
-            const [key, value] = cookie.trim().split('=');
-            acc[key] = value;
-            return acc;
-        }, {});
-        
-        if (cookies['ASP.NET_SessionId'] || cookies['__RequestVerificationToken'] || cookies['sessionid']) {
-            console.log('[LOGIN] Session cookies found');
-            localStorage.setItem('nottingham_forest_session_cookies', JSON.stringify(cookies));
-        }
-        
-        console.log('[LOGIN] No authentication tokens found');
         return null;
     }
-    
-    // Monitor for successful login and extract data
+
     function monitorLoginSuccess() {
-        // Check if we're on a logged-in page (Nottingham Forest specific)
-        if (window.location.href.includes('nottinghamforest.co.uk') && 
-            !window.location.href.includes('login.nottinghamforest.co.uk')) {
-            
-            console.log('[LOGIN] Login success detected, extracting auth data...');
+        const loc = window.location.href.toLowerCase();
+        if (loc.includes('nottinghamforest.co.uk') && !loc.includes('login.nottinghamforest.co.uk')) {
             extractAuthData();
-            
-            // Notify background script
-            chrome.runtime.sendMessage({
-                action: 'loginSuccess',
-                url: window.location.href
+            chrome.runtime.sendMessage({ action: 'loginSuccess', url: window.location.href }, () => {
+                void chrome.runtime.lastError;
             });
         }
     }
-    
-    // Set up monitoring for login success
+
     setInterval(monitorLoginSuccess, 2000);
-    
-    // Extract auth data on page load if already logged in
-    if (window.location.href.includes('nottinghamforest.co.uk') && 
-        !window.location.href.includes('login.nottinghamforest.co.uk')) {
-        console.log('[LOGIN] Already on logged-in page, extracting auth data...');
-        extractAuthData();
-    }
-    
-    // Helper function to get stored auth token
-    window.getNottinghamForestAuthToken = function() {
-        return localStorage.getItem('nottingham_forest_auth_token');
-    };
-    
-    // Helper function to get stored session cookies
-    window.getNottinghamForestSessionCookies = function() {
-        const cookies = localStorage.getItem('nottingham_forest_session_cookies');
-        return cookies ? JSON.parse(cookies) : null;
-    };
-    
     console.log('[LOGIN] Nottingham Forest login content script initialization complete');
 })();
